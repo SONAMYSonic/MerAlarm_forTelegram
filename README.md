@@ -1,6 +1,6 @@
 # MerAlarm_forTelegram
 
-##Thanks for Claude
+## Thanks for Claude
 이 프로젝트는 클로드 코드의 도움을 받아 제작되었습니다.
 
 메루카리(jp.mercari.com)에서 키워드로 신착 상품과 가격 인하를 감시해 텔레그램으로 알린다.
