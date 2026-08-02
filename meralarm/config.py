@@ -110,6 +110,27 @@ class Config:
     fx_cache_path: Path
 
 
+def ensure_writable(root: Path = ROOT) -> None:
+    """설정과 기록을 남길 수 있는 자리인지 먼저 확인한다.
+
+    압축을 풀지 않고 zip 안에서 바로 실행하거나 Program Files 같은 곳에 두면
+    파일을 못 만든다. 그대로 두면 PermissionError 가 그대로 튀어나와 사용자는
+    무엇이 잘못됐는지 알 수 없다.
+    """
+    probe = root / ".write_test"
+    try:
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+    except OSError:
+        raise ConfigError(
+            f"이 폴더에 파일을 만들 수 없습니다.\n"
+            f"        {root}\n\n"
+            "        압축을 풀지 않고 zip 안에서 바로 실행하지 않았는지,\n"
+            "        Program Files 처럼 권한이 필요한 곳에 두지 않았는지 확인하세요.\n"
+            "        바탕화면이나 문서 폴더로 옮기면 해결됩니다."
+        ) from None
+
+
 def _read_env(path: Path) -> dict[str, str]:
     if not path.exists():
         raise ConfigError(
@@ -228,6 +249,7 @@ def _parse_keyword(
 
 
 def load() -> Config:
+    ensure_writable()
     env = _read_env(ROOT / ".env")
     token = env.get("TELEGRAM_BOT_TOKEN")
     chat_id = env.get("TELEGRAM_CHAT_ID")

@@ -14,6 +14,11 @@ from typing import Any
 from ruamel.yaml import YAML
 
 
+# 배포판이 처음 담고 나오는 자리표시 키워드. 설정에는 키워드가 최소 하나 있어야
+# 해서 비워둘 수 없다. 사용자가 자기 키워드를 넣으면 이것은 치운다.
+EXAMPLE_KEYWORD = "예시 키워드"
+
+
 class KeywordStoreError(RuntimeError):
     """사용자에게 그대로 보여줄 수 있는 메시지를 담는다."""
 

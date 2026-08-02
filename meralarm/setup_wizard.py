@@ -232,15 +232,34 @@ def _ask_keyword(config_path: Path) -> None:
     try:
         keyword = input("  키워드: ").strip()
     except (EOFError, KeyboardInterrupt):
-        return
+        keyword = ""
+
+    from .config_store import EXAMPLE_KEYWORD, KeywordStore
+
+    store = KeywordStore(config_path)
+
     if not keyword:
+        # 설정에는 키워드가 최소 하나 있어야 하므로 예시를 남긴다. 그대로 두면
+        # 원하지도 않는 상품 알림이 오므로 무엇을 해야 하는지 알려준다.
+        try:
+            if EXAMPLE_KEYWORD in store.names():
+                _say(f"\n  ⚠ '{EXAMPLE_KEYWORD}' 가 그대로 남아 있습니다.")
+                _say("     텔레그램에서 /add 로 원하는 키워드를 넣고")
+                _say("     /del 로 예시를 지워주세요.\n")
+        except Exception:
+            pass
         return
 
     try:
-        from .config_store import KeywordStore
-
-        KeywordStore(config_path).add(keyword)
-        _say(f"  → '{keyword}' 를 추가했습니다.\n")
+        store.add(keyword)
+        _say(f"  → '{keyword}' 를 추가했습니다.")
+        # 사용자가 자기 키워드를 넣었으면 예시는 치운다. 안 그러면 관심도 없는
+        # 상품 알림이 계속 온다.
+        names = store.names()
+        if EXAMPLE_KEYWORD in names and len(names) > 1:
+            store.remove(names.index(EXAMPLE_KEYWORD) + 1)
+            _say("  → 예시 키워드는 지웠습니다.")
+        _say()
     except Exception as e:
         _say(f"  → 추가하지 못했습니다({e}). 나중에 /add 로 넣어주세요.\n")
 

@@ -12,7 +12,8 @@ import sys
 from logging.handlers import RotatingFileHandler
 
 from .commands import CommandListener
-from .config import Config, ConfigError, load
+from .config import Config, ConfigError, ensure_writable, load
+from .single_instance import AlreadyRunning, SingleInstance
 from .control import Controls
 from .notifiers.discord import DiscordNotifier
 from .notifiers.queue import SendQueue
@@ -96,6 +97,21 @@ def main() -> None:
     env_path = ROOT / ".env"
     forced = "--setup" in sys.argv
 
+    try:
+        ensure_writable()
+    except ConfigError as e:
+        sys.exit(f"[설정 오류] {e}")
+
+    lock = SingleInstance(ROOT / ".meralarm.lock")
+    try:
+        lock.acquire()
+    except AlreadyRunning:
+        sys.exit(
+            "이미 실행 중입니다.\n"
+            "        작업 표시줄 오른쪽 아래의 종 모양 아이콘을 확인하세요.\n"
+            "        (안 보이면 ^ 를 눌러 숨겨진 아이콘을 펼치세요)"
+        )
+
     if forced or setup_wizard.needs_setup(env_path):
         if setup_wizard.can_prompt():
             asyncio.run(setup_wizard.run(env_path, ROOT / "config.yaml"))
@@ -114,6 +130,8 @@ def main() -> None:
         asyncio.run(run(cfg))
     except KeyboardInterrupt:
         log.info("Ctrl+C 로 종료합니다")
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__":
