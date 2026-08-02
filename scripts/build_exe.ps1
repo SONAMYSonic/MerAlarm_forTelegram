@@ -99,7 +99,9 @@ logs\         실행 기록. 문제가 생기면 여기를 보세요
 "@ | Out-File "$out\사용법.txt" -Encoding UTF8
 
 Write-Output "== 압축 =="
-$zip = "dist\MerAlarm.zip"
+# 파일 이름에 버전을 넣어야 받은 사람이 무엇을 갖고 있는지 알 수 있다.
+$version = (Select-String -Path "meralarm\__init__.py" -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+$zip = "dist\MerAlarm-v$version.zip"
 Compress-Archive -Path "$out\*" -DestinationPath $zip -Force
 
 $exeMb = [math]::Round((Get-Item "$out\MerAlarm.exe").Length / 1MB, 1)

@@ -19,6 +19,7 @@ from .notifiers.discord import DiscordNotifier
 from .notifiers.queue import SendQueue
 from .notifiers.telegram import TelegramNotifier
 from . import setup_wizard
+from . import __version__
 from .scheduler import Scheduler
 from .sources.mercapi_source import MercapiSource
 from .store import SeenStore
@@ -61,7 +62,7 @@ async def run(cfg: Config) -> None:
     scheduler = Scheduler(cfg, MercapiSource(), store, queue, controls)
     tray = Tray(controls, cfg.log_path, [k.name for k in cfg.keywords])
     tray.start()
-    log.info("알림 채널: %s", " · ".join(queue.channels))
+    log.info("MerAlarm %s · 알림 채널: %s", __version__, " · ".join(queue.channels))
 
     commands = CommandListener(cfg, controls, scheduler, queue)
 

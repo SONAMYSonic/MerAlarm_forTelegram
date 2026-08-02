@@ -306,8 +306,10 @@ class CommandListener:
             state = f"⏸ 일시정지 ({_humanize(remain)} 뒤 재개)" if remain else "⏸ 일시정지"
         else:
             state = "🔍 감시 중"
+        from . import __version__
+
         return (
-            f"<b>{state}</b>\n\n"
+            f"<b>{state}</b>  <i>v{__version__}</i>\n\n"
             f"가동 {hours:.1f}시간\n"
             f"키워드 {len(self._scheduler.keyword_names)}개 · 기본 주기 "
             f"{self._cfg.poll.default_interval_sec}초\n"
