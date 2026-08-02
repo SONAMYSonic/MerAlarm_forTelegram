@@ -1,0 +1,16 @@
+# 비밀값 — 절대 공유 금지
+.env
+
+# 플랫폼 종속이라 옮겨봐야 안 돌아간다. 옮긴 곳에서 새로 만든다.
+.venv/
+
+# 실행하면서 쌓이는 것
+data/
+logs/
+
+# 배포용 묶음 (scripts/pack.ps1 이 만든다)
+MerAlarm-deploy.tar.gz
+*.tar.gz
+
+__pycache__/
+*.py[cod]
