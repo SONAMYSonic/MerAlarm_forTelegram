@@ -18,8 +18,9 @@ import httpx
 from .config import Config, ConfigError
 from .config_store import KeywordStore, KeywordStoreError
 from .control import Controls
+from .alerts import raw
 from .notifiers.queue import SendQueue
-from .notifiers.telegram import API, Message
+from .notifiers.telegram import API
 from .scheduler import Scheduler
 
 log = logging.getLogger(__name__)
@@ -268,7 +269,9 @@ class CommandListener:
         except Exception:
             log.exception("명령 처리 중 오류")
             reply = "⚠️ 처리 중 오류가 났습니다. 로그를 확인하세요."
-        self._queue.put(Message(text=reply))
+        # 명령 응답은 물어본 곳에만 간다. 디스코드에 텔레그램 명령 결과가 뜨면
+        # 왜 뜨는지 알 수 없다.
+        self._queue.put(raw(reply, only="telegram"))
 
     # ---- 명령 처리 ----
 

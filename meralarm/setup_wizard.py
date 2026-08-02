@@ -51,13 +51,16 @@ def needs_setup(path: Path) -> bool:
     return not env.get("TELEGRAM_BOT_TOKEN") or not env.get("TELEGRAM_CHAT_ID")
 
 
-def write_env(path: Path, token: str, chat_id: str) -> None:
+def write_env(path: Path, token: str, chat_id: str, discord: str = "") -> None:
     path.write_text(
         "# MerAlarm 설정. 이 파일에는 봇 토큰이 들어 있으니 남에게 보내지 마세요.\n"
         "# 다시 설정하려면 프로그램을 --setup 옵션으로 실행하세요.\n"
         "\n"
         f"TELEGRAM_BOT_TOKEN={token}\n"
-        f"TELEGRAM_CHAT_ID={chat_id}\n",
+        f"TELEGRAM_CHAT_ID={chat_id}\n"
+        "\n"
+        "# (선택) 디스코드에도 함께 보내려면 웹후크 URL 을 넣으세요.\n"
+        f"DISCORD_WEBHOOK_URL={discord}\n",
         encoding="utf-8",
     )
     try:
@@ -164,6 +167,40 @@ async def _wait_for_chat(client: httpx.AsyncClient, token: str, username: str) -
     return None
 
 
+async def _ask_discord(client: httpx.AsyncClient, known: str = "") -> str:
+    """선택 사항. 건너뛰어도 텔레그램만으로 완전히 동작한다."""
+    if known:
+        return known
+
+    _say("디스코드에도 같이 받으시겠어요? (선택)")
+    _say("  받고 싶으시면 디스코드에서 웹후크 URL 을 만들어 붙여넣으세요.")
+    _say("    채널 옆 톱니 → 연동 → 웹후크 → 새 웹후크 → 웹후크 URL 복사")
+    _say("  필요 없으면 그냥 Enter 를 누르세요.")
+    _say()
+    try:
+        url = input("  웹후크 URL (건너뛰려면 Enter): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return ""
+    if not url:
+        _say()
+        return ""
+    if "discord.com/api/webhooks/" not in url:
+        _say("  → 웹후크 주소가 아닌 것 같습니다. 건너뜁니다.\n")
+        return ""
+
+    try:
+        response = await client.post(
+            url, json={"content": "🔔 MerAlarm 연결됐습니다."}, timeout=20
+        )
+        if response.status_code in (200, 204):
+            _say("  → 확인했습니다. 디스코드를 보세요.\n")
+            return url
+        _say(f"  → 디스코드가 거부했습니다({response.status_code}). 건너뜁니다.\n")
+    except Exception:
+        _say("  → 연결하지 못했습니다. 건너뜁니다.\n")
+    return ""
+
+
 async def _send_test(client: httpx.AsyncClient, token: str, chat_id: str) -> bool:
     _say("[3/3] 테스트 알림 보내기")
     try:
@@ -235,7 +272,8 @@ async def run(env_path: Path, config_path: Path) -> bool:
                 _say("설정을 중단했습니다.")
                 return False
 
-        write_env(env_path, token, chat_id)
+        discord = await _ask_discord(client, existing.get("DISCORD_WEBHOOK_URL", ""))
+        write_env(env_path, token, chat_id, discord)
         await _send_test(client, token, chat_id)
 
     _ask_keyword(config_path)

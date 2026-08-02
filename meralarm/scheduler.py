@@ -14,11 +14,10 @@ from datetime import date, datetime
 
 import httpx
 
-from . import filters, fx
+from . import alerts, filters, fx
 from .config import Config, KeywordConfig
 from .control import Controls
 from .models import Item
-from .notifiers import telegram
 from .notifiers.queue import SendQueue
 from .ratelimit import RateLimiter
 from .sources.base import ItemSource
@@ -203,11 +202,11 @@ class Scheduler:
         new = sorted(new, key=lambda i: i.created)
 
         if len(new) >= self._cfg.notify.batch_threshold:
-            message = telegram.format_batch(new, kw.name, self._krw_rate)
             self._queue.put(
-                telegram.Message(
-                    text=message.text,
-                    photo=None,
+                alerts.batch(
+                    new,
+                    kw.name,
+                    self._krw_rate,
                     on_sent=lambda items=tuple(new): self._on_notified(kw.name, list(items)),
                 )
             )
@@ -215,11 +214,11 @@ class Scheduler:
             return
 
         for item in new:
-            message = telegram.format_new(item, kw.name, self._krw_rate)
             self._queue.put(
-                telegram.Message(
-                    text=message.text,
-                    photo=message.photo,
+                alerts.new_item(
+                    item,
+                    kw.name,
+                    self._krw_rate,
                     # 전송에 성공한 뒤에 기록한다. 먼저 기록하면 전송 전에 죽었을 때
                     # 본 것으로 남아 그 상품은 영영 알림이 오지 않는다.
                     on_sent=lambda i=item: self._on_notified(kw.name, [i]),
@@ -228,11 +227,12 @@ class Scheduler:
 
     def _enqueue_drops(self, kw: KeywordConfig, drops: list[tuple[Item, int]]) -> None:
         for item, old_price in drops:
-            message = telegram.format_drop(item, kw.name, old_price, self._krw_rate)
             self._queue.put(
-                telegram.Message(
-                    text=message.text,
-                    photo=message.photo,
+                alerts.price_drop(
+                    item,
+                    kw.name,
+                    old_price,
+                    self._krw_rate,
                     on_sent=lambda i=item: self._on_notified(kw.name, [i]),
                 )
             )
@@ -327,7 +327,7 @@ class Scheduler:
             ):
                 state.alerted = True
                 self._queue.put(
-                    telegram.format_notice(
+                    alerts.notice(
                         "⚠️ 감시 오류",
                         f"'{state.cfg.name}' 수집이 {state.fails}회 연속 실패했습니다.\n"
                         f"원인: {type(e).__name__}: {e}\n"
@@ -341,7 +341,7 @@ class Scheduler:
             if state.alerted:
                 state.alerted = False
                 self._queue.put(
-                    telegram.format_notice(
+                    alerts.notice(
                         "✅ 감시 복구", f"'{state.cfg.name}' 수집이 정상으로 돌아왔습니다."
                     )
                 )
@@ -398,7 +398,7 @@ class Scheduler:
         uptime = now - self.stats.started
         hours = uptime.total_seconds() / 3600
         self._queue.put(
-            telegram.format_notice(
+            alerts.notice(
                 "💓 MerAlarm 정상 동작",
                 f"가동 {hours:.0f}시간\n"
                 f"감시 키워드 {len(self._states)}개\n"

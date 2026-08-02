@@ -9,7 +9,6 @@ TELEGRAM_CHAT_ID 는 비워두면 getUpdates 로 자동 탐지한다.
 """
 
 import asyncio
-import os
 import sys
 from pathlib import Path
 

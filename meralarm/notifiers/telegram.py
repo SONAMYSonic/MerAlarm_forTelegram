@@ -1,4 +1,4 @@
-"""텔레그램 메시지 조립과 전송.
+"""텔레그램으로 알림을 보낸다.
 
 전송 실패는 두 종류다. 429 처럼 기다리면 풀리는 것과, 토큰 오타처럼 몇 번을
 다시 보내도 안 되는 것. 후자를 무한 재시도하면 프로그램이 그 자리에 갇히므로
@@ -7,12 +7,12 @@
 
 import asyncio
 import logging
-from collections.abc import Callable
-from dataclasses import dataclass
 from html import escape
 
 import httpx
 
+from .. import alerts
+from ..alerts import Alert
 from ..models import Item
 
 API = "https://api.telegram.org/bot{token}/{method}"
@@ -21,20 +21,9 @@ MAX_ATTEMPTS = 3
 log = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True, slots=True)
-class Message:
-    text: str
-    photo: str | None = None
-    # 전송에 성공한 뒤에만 실행된다. 보내기도 전에 "본 것"으로 기록해두면
-    # 그 직전에 죽었을 때 해당 상품은 영영 알림이 오지 않는다.
-    on_sent: Callable[[], None] | None = None
-
-
-def _price(item: Item, krw_rate: float | None) -> str:
-    text = f"¥{item.price:,}"
-    if krw_rate:
-        text += f"  (약 ₩{round(item.price * krw_rate):,})"
-    return text
+def _tag(keyword: str) -> str:
+    # 해시태그로 쓰려면 공백이 없어야 텔레그램이 하나로 인식한다.
+    return escape(keyword.replace(" ", "_"))
 
 
 def _origin(item: Item) -> str:
@@ -43,72 +32,69 @@ def _origin(item: Item) -> str:
     return " · 🏪 Shops" if item.is_shops else ""
 
 
-def _tag(keyword: str) -> str:
-    # 해시태그로 쓰려면 공백이 없어야 텔레그램이 하나로 인식한다.
-    return escape(keyword.replace(" ", "_"))
-
-
-def format_new(item: Item, keyword: str, krw_rate: float | None) -> Message:
-    # 처음 본 상품이 곧 새로 나온 상품은 아니다. 오래전에 올라온 물건이 갱신되면서
-    # 검색 상위로 떠오른 것일 수 있어, 그 경우 🆕 를 붙이면 거짓말이 된다.
-    age = item.age_days
-    header = f"🆕 <b>#{_tag(keyword)}</b>" if age < 1 else (
-        f"🔁 <b>#{_tag(keyword)}</b> · {age}일 전 출품"
-    )
-    return Message(
-        text=(
-            f"{header}\n\n"
-            f"{escape(item.name)}\n\n"
-            f"💴 <b>{_price(item, krw_rate)}</b>\n"
-            f"📦 {item.condition} · 배송비 {item.shipping_payer}{_origin(item)}\n"
-            f"🕒 {item.created:%Y-%m-%d %H:%M} 출품\n\n"
-            f'<a href="{item.url}">🛒 상품 보기</a>'
-        ),
-        photo=item.thumbnail or None,
+def _new_text(alert: Alert) -> str:
+    item = alert.item
+    mark, aged = alerts.headline(item)
+    head = f"{mark} <b>#{_tag(alert.keyword)}</b>" + (f" · {aged}" if aged else "")
+    return (
+        f"{head}\n\n"
+        f"{escape(item.name)}\n\n"
+        f"💴 <b>{alerts.price_text(item, alert.krw_rate)}</b>\n"
+        f"📦 {item.condition} · 배송비 {item.shipping_payer}{_origin(item)}\n"
+        f"🕒 {item.created:%Y-%m-%d %H:%M} 출품\n\n"
+        f'<a href="{item.url}">🛒 상품 보기</a>'
     )
 
 
-def format_drop(item: Item, keyword: str, old_price: int, krw_rate: float | None) -> Message:
-    cut = old_price - item.price
-    percent = cut / old_price * 100
-    return Message(
-        text=(
-            f"📉 <b>#{_tag(keyword)}</b> 가격 인하\n\n"
-            f"{escape(item.name)}\n\n"
-            f"💴 <s>¥{old_price:,}</s> → <b>{_price(item, krw_rate)}</b>\n"
-            f"🔻 ¥{cut:,} 내림 ({percent:.0f}%)\n"
-            f"📦 {item.condition} · 배송비 {item.shipping_payer}\n\n"
-            f'<a href="{item.url}">🛒 상품 보기</a>'
-        ),
-        photo=item.thumbnail or None,
+def _drop_text(alert: Alert) -> str:
+    item = alert.item
+    cut = alert.old_price - item.price
+    percent = cut / alert.old_price * 100
+    return (
+        f"📉 <b>#{_tag(alert.keyword)}</b> 가격 인하\n\n"
+        f"{escape(item.name)}\n\n"
+        f"💴 <s>¥{alert.old_price:,}</s> → <b>{alerts.price_text(item, alert.krw_rate)}</b>\n"
+        f"🔻 ¥{cut:,} 내림 ({percent:.0f}%)\n"
+        f"📦 {item.condition} · 배송비 {item.shipping_payer}{_origin(item)}\n\n"
+        f'<a href="{item.url}">🛒 상품 보기</a>'
     )
 
 
-def format_batch(items: list[Item], keyword: str, krw_rate: float | None) -> Message:
-    """한꺼번에 많이 올라왔을 때. 개별 전송은 텔레그램 제한에 걸린다."""
-    lines = [f"🆕 <b>#{_tag(keyword)}</b> 신규 {len(items)}건\n"]
-    for item in items:
+def _batch_text(alert: Alert) -> str:
+    lines = [f"🆕 <b>#{_tag(alert.keyword)}</b> 신규 {len(alert.items)}건\n"]
+    for item in alert.items:
         lines.append(
             f'· <a href="{item.url}">{escape(item.name[:45])}</a>\n'
-            f"  {_price(item, krw_rate)} · {item.condition}"
+            f"  {alerts.price_text(item, alert.krw_rate)} · {item.condition}"
         )
-    return Message(text="\n".join(lines))
-
-
-def format_notice(title: str, body: str) -> Message:
-    return Message(text=f"<b>{escape(title)}</b>\n\n{escape(body)}")
+    return "\n".join(lines)
 
 
 class TelegramNotifier:
+    name = "telegram"
+
     def __init__(self, token: str, chat_id: str) -> None:
         self._token = token
         self._chat_id = chat_id
         self._client = httpx.AsyncClient(timeout=30)
 
-    async def send(self, message: Message) -> bool:
+    def render(self, alert: Alert) -> tuple[str, str | None]:
+        """(본문, 사진 URL)."""
+        if alert.kind == alerts.NEW:
+            return _new_text(alert), alert.item.thumbnail or None
+        if alert.kind == alerts.DROP:
+            return _drop_text(alert), alert.item.thumbnail or None
+        if alert.kind == alerts.BATCH:
+            return _batch_text(alert), None
+        if alert.kind == alerts.RAW:
+            return alert.body, None
+        return f"<b>{escape(alert.title)}</b>\n\n{escape(alert.body)}", None
+
+    async def send(self, alert: Alert) -> bool:
+        text, photo = self.render(alert)
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
-                response = await self._post(message)
+                response = await self._post(text, photo)
             except httpx.HTTPError as e:
                 log.warning("텔레그램 전송 오류 (%d/%d): %s", attempt, MAX_ATTEMPTS, e)
                 await asyncio.sleep(2**attempt)
@@ -131,14 +117,14 @@ class TelegramNotifier:
         log.error("텔레그램 전송을 %d회 시도 후 포기했습니다", MAX_ATTEMPTS)
         return False
 
-    async def _post(self, message: Message) -> httpx.Response:
-        if message.photo:
+    async def _post(self, text: str, photo: str | None) -> httpx.Response:
+        if photo:
             return await self._client.post(
                 API.format(token=self._token, method="sendPhoto"),
                 data={
                     "chat_id": self._chat_id,
-                    "photo": message.photo,
-                    "caption": message.text,
+                    "photo": photo,
+                    "caption": text,
                     "parse_mode": "HTML",
                 },
             )
@@ -146,7 +132,7 @@ class TelegramNotifier:
             API.format(token=self._token, method="sendMessage"),
             data={
                 "chat_id": self._chat_id,
-                "text": message.text,
+                "text": text,
                 "parse_mode": "HTML",
                 "disable_web_page_preview": "true",
             },

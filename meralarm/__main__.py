@@ -14,6 +14,7 @@ from logging.handlers import RotatingFileHandler
 from .commands import CommandListener
 from .config import Config, ConfigError, load
 from .control import Controls
+from .notifiers.discord import DiscordNotifier
 from .notifiers.queue import SendQueue
 from .notifiers.telegram import TelegramNotifier
 from . import setup_wizard
@@ -52,10 +53,14 @@ async def run(cfg: Config) -> None:
 
     store = SeenStore(cfg.db_path)
     notifier = TelegramNotifier(cfg.telegram_token, cfg.telegram_chat_id)
-    queue = SendQueue(notifier)
+    notifiers = [notifier]
+    if cfg.discord_webhook:
+        notifiers.append(DiscordNotifier(cfg.discord_webhook))
+    queue = SendQueue(notifiers)
     scheduler = Scheduler(cfg, MercapiSource(), store, queue, controls)
     tray = Tray(controls, cfg.log_path, [k.name for k in cfg.keywords])
     tray.start()
+    log.info("알림 채널: %s", " · ".join(queue.channels))
 
     commands = CommandListener(cfg, controls, scheduler, queue)
 
@@ -79,7 +84,8 @@ async def run(cfg: Config) -> None:
         sender.cancel()
         tray.stop()
         await commands.close()
-        await notifier.close()
+        for target in notifiers:
+            await target.close()
         store.close()
         log.info("종료했습니다")
 

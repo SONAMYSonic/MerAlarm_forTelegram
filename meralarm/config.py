@@ -102,6 +102,8 @@ class Config:
     keywords: tuple[KeywordConfig, ...]
     telegram_token: str
     telegram_chat_id: str
+    # 비어 있으면 디스코드로는 보내지 않는다. 텔레그램만으로도 완전히 동작한다.
+    discord_webhook: str
     config_path: Path
     db_path: Path
     log_path: Path
@@ -343,6 +345,7 @@ def load() -> Config:
         keywords=keywords,
         telegram_token=token,
         telegram_chat_id=chat_id,
+        discord_webhook=env.get("DISCORD_WEBHOOK_URL", ""),
         config_path=config_path,
         db_path=data_dir / "seen.db",
         log_path=ROOT / "logs" / "meralarm.log",
