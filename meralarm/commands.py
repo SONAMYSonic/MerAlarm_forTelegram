@@ -33,6 +33,8 @@ HELP = """<b>MerAlarm 명령어</b>
 /list — 감시 중인 키워드
 /add <i>키워드</i> — 키워드 추가
 /del <i>번호</i> — 키워드 삭제
+/config — 현재 설정 전부 보기
+/set <i>항목 값</i> — 설정 바꾸기
 /pause <i>[30m]</i> — 잠시 멈춤 (시간 생략 시 무기한)
 /resume — 다시 시작
 /help — 이 도움말
@@ -46,6 +48,15 @@ HELP = """<b>MerAlarm 명령어</b>
 
 제외어에는 <b>모두 -를 붙여야</b> 합니다. 하나라도 빠지면 키워드의 일부인지
 제외어인지 알 수 없어 추가하지 않고 알려드립니다.
+
+<b>설정 바꾸기</b>
+
+<code>/set interval 60</code> — 감시 주기(초)
+<code>/set age 7</code> — 출품 7일 이내만
+<code>/set krw off</code> — 원화 환산 끄기
+<code>/set 2 price_max 50000</code> — 2번 키워드만 가격 상한
+
+항목 목록은 <code>/set</code> 만 쳐도 나옵니다.
 
 키워드를 추가하면 첫 회차는 조용히 목록만 담고 그다음부터 알립니다."""
 
@@ -110,6 +121,57 @@ def parse_add(argument: str) -> tuple[str, tuple[str, ...]]:
     return query, tuple(excludes)
 
 
+OFF_WORDS = {"off", "없음", "해제", "none", "null", "-"}
+
+
+def _switch(text: str) -> bool:
+    lowered = text.lower()
+    if lowered in {"on", "켜기", "true", "1", "yes"}:
+        return True
+    if lowered in OFF_WORDS | {"false", "0", "no", "끄기"}:
+        return False
+    raise ParseError("on 또는 off 로 써주세요.")
+
+
+def _ranged(label: str, low: int, high: int, allow_off: bool = False):
+    def parse(text: str):
+        if allow_off and text.lower() in OFF_WORDS:
+            return None
+        if not text.lstrip("-").isdigit():
+            raise ParseError(
+                f"{label} 은(는) 숫자여야 합니다."
+                + (" 해제하려면 off 라고 쓰세요." if allow_off else "")
+            )
+        value = int(text)
+        if not low <= value <= high:
+            raise ParseError(f"{label} 은(는) {low}~{high} 사이여야 합니다. 받은 값: {value}")
+        return value
+
+    return parse
+
+
+# 사용자에게 보이는 이름 → (config.yaml 경로, 설명, 값 해석기)
+GLOBAL_SETTINGS = {
+    "interval": (("poll", "default_interval_sec"), "감시 주기(초)", _ranged("주기", 10, 3600)),
+    "gap": (("poll", "min_request_gap_sec"), "요청 간 최소 간격(초)", _ranged("간격", 1, 60)),
+    "age": (("notify", "max_age_days"), "출품 경과일 제한(일)", _ranged("경과일", 1, 3650, True)),
+    "batch": (("notify", "batch_threshold"), "묶음 요약 기준(건)", _ranged("기준", 2, 100)),
+    "krw": (("notify", "show_krw"), "원화 환산", _switch),
+    "drop": (("notify", "price_drop"), "가격 인하 알림", _switch),
+    "night": (("poll", "night_mode", "enabled"), "심야 자동 감속", _switch),
+    "heartbeat": (("notify", "heartbeat_hour"), "생존 보고 시각(시)", _ranged("시각", 0, 23, True)),
+    "keep": (("store", "keep_days"), "기록 보관 기간(일)", _ranged("보관 기간", 7, 3650)),
+}
+
+# 키워드별 설정. off 를 주면 항목을 지워 전역값을 따르거나 제한을 없앤다.
+KEYWORD_SETTINGS = {
+    "interval": ("interval_sec", "감시 주기(초)", _ranged("주기", 10, 3600, True)),
+    "price_min": ("price_min", "최저 가격(엔)", _ranged("가격", 0, 100_000_000, True)),
+    "price_max": ("price_max", "최고 가격(엔)", _ranged("가격", 0, 100_000_000, True)),
+    "age": ("max_age_days", "출품 경과일 제한(일)", _ranged("경과일", 1, 3650, True)),
+}
+
+
 def _parse_duration(text: str) -> float | None:
     """`30m` `2h` `90s` `15`(분) → 초. 못 읽으면 None."""
     match = DURATION.match(text.strip())
@@ -154,7 +216,12 @@ class CommandListener:
             try:
                 updates = await self._fetch()
             except Exception as e:
-                log.warning("명령어 수신 실패(%s). 10초 뒤 재시도", type(e).__name__)
+                # 같은 토큰으로 두 곳에서 동시에 받으면 텔레그램이 한쪽을 끊는다.
+                # 흔한 실수라 원문을 그대로 남겨야 원인을 알 수 있다.
+                hint = ""
+                if "conflict" in str(e).lower():
+                    hint = " — 같은 봇을 두 곳에서 돌리고 있지 않은지 확인하세요"
+                log.warning("명령어 수신 실패: %s%s. 10초 뒤 재시도", e, hint)
                 await asyncio.sleep(10)
                 continue
             for update in updates:
@@ -218,6 +285,8 @@ class CommandListener:
             "/list": self._list,
             "/add": self._add,
             "/del": self._delete,
+            "/set": self._set,
+            "/config": self._config,
             "/pause": self._pause,
             "/resume": self._resume,
         }
@@ -271,7 +340,7 @@ class CommandListener:
             return f"⚠️ {e}"
 
         try:
-            added = self._store.add(query, excludes)
+            added = self._store.add(query, excludes, validate=self._validator())
         except KeywordStoreError as e:
             return f"⚠️ {escape(str(e))}"
 
@@ -288,11 +357,135 @@ class CommandListener:
         if not argument.isdigit():
             return "사용법: <code>/del 번호</code>\n/list 로 번호를 확인하세요."
         try:
-            removed = self._store.remove(int(argument))
+            removed = self._store.remove(int(argument), validate=self._validator())
         except KeywordStoreError as e:
             return f"⚠️ {escape(str(e))}"
         self._reload()
         return f"🗑 <b>{escape(removed)}</b> 감시를 중단했습니다."
+
+    def _set(self, argument: str) -> str:
+        tokens = argument.split()
+        if len(tokens) < 2:
+            return self._set_usage()
+
+        # 첫 토큰이 숫자면 그 번호의 키워드 설정이다. /del 과 같은 번호 체계.
+        if tokens[0].isdigit():
+            if len(tokens) < 3:
+                return self._set_usage()
+            return self._set_keyword(int(tokens[0]), tokens[1].lower(), tokens[2])
+        return self._set_global(tokens[0].lower(), tokens[1])
+
+    def _set_usage(self) -> str:
+        globals_ = " ".join(f"<code>{k}</code>" for k in GLOBAL_SETTINGS)
+        per_kw = " ".join(f"<code>{k}</code>" for k in KEYWORD_SETTINGS)
+        return (
+            "사용법\n"
+            "<code>/set 항목 값</code> — 전체에 적용\n"
+            "<code>/set 번호 항목 값</code> — 그 키워드에만 적용\n\n"
+            f"전체: {globals_}\n"
+            f"키워드별: {per_kw}\n\n"
+            "예\n"
+            "<code>/set interval 60</code>\n"
+            "<code>/set age 7</code>\n"
+            "<code>/set krw off</code>\n"
+            "<code>/set 2 price_max 50000</code>\n"
+            "<code>/set 2 price_max off</code>\n\n"
+            "현재 값은 /config 로 봅니다."
+        )
+
+    def _set_global(self, key: str, raw: str) -> str:
+        spec = GLOBAL_SETTINGS.get(key)
+        if spec is None:
+            return f"모르는 항목입니다: <code>{escape(key)}</code>\n\n" + self._set_usage()
+        path, label, parse = spec
+        try:
+            value = parse(raw)
+        except ParseError as e:
+            return f"⚠️ {e}"
+
+        try:
+            self._store.set_global(path, value, validate=self._validator())
+        except KeywordStoreError as e:
+            return f"⚠️ {escape(str(e))}"
+
+        self._reload()
+        return f"✅ <b>{label}</b> → {self._show(value)}"
+
+    def _set_keyword(self, index: int, key: str, raw: str) -> str:
+        spec = KEYWORD_SETTINGS.get(key)
+        if spec is None:
+            allowed = " ".join(f"<code>{k}</code>" for k in KEYWORD_SETTINGS)
+            return f"키워드별로 바꿀 수 있는 항목: {allowed}"
+        field, label, parse = spec
+        try:
+            value = parse(raw)
+        except ParseError as e:
+            return f"⚠️ {e}"
+
+        try:
+            name = self._store.set_keyword(index, field, value, validate=self._validator())
+        except KeywordStoreError as e:
+            return f"⚠️ {escape(str(e))}"
+
+        self._reload()
+        return f"✅ <b>{escape(name)}</b> · {label} → {self._show(value)}"
+
+    @staticmethod
+    def _show(value) -> str:
+        if value is None:
+            return "<i>지정 안 함</i>"
+        if isinstance(value, bool):
+            return "켜짐" if value else "꺼짐"
+        return f"<b>{value:,}</b>" if isinstance(value, int) else f"<b>{value}</b>"
+
+    def _config(self, _: str) -> str:
+        try:
+            from .config import load
+
+            cfg = load()
+        except ConfigError as e:
+            return f"⚠️ 설정을 읽지 못했습니다: {escape(str(e))}"
+
+        night = cfg.poll.night
+        lines = [
+            "<b>전체 설정</b>",
+            f"· 감시 주기 <b>{cfg.poll.default_interval_sec}초</b> "
+            f"(요청 간격 {cfg.poll.min_request_gap_sec:g}초)",
+            f"· 출품 경과일 제한 {self._show(cfg.notify.max_age_days)}"
+            + ("일" if cfg.notify.max_age_days is not None else ""),
+            f"· 묶음 요약 기준 <b>{cfg.notify.batch_threshold}건</b>",
+            f"· 원화 환산 {self._show(cfg.notify.show_krw)}"
+            f" · 인하 알림 {self._show(cfg.notify.price_drop)}",
+            f"· 심야 감속 {self._show(night.enabled)}"
+            + (f" ({night.start:%H:%M}~{night.end:%H:%M} {night.interval_sec}초)"
+               if night.enabled else ""),
+            f"· 생존 보고 {self._show(cfg.notify.heartbeat_hour)}"
+            + ("시" if cfg.notify.heartbeat_hour is not None else ""),
+            f"· 기록 보관 <b>{cfg.store.keep_days}일</b>",
+            "",
+            "<b>키워드</b>",
+        ]
+        for i, kw in enumerate(cfg.keywords, 1):
+            detail = []
+            if kw.price_min is not None or kw.price_max is not None:
+                low = f"¥{kw.price_min:,}" if kw.price_min is not None else ""
+                high = f"¥{kw.price_max:,}" if kw.price_max is not None else ""
+                detail.append(f"가격 {low}~{high}")
+            if kw.interval_sec != cfg.poll.default_interval_sec:
+                detail.append(f"주기 {kw.interval_sec}초")
+            if kw.exclude:
+                detail.append("제외 " + ", ".join(kw.exclude))
+            lines.append(f"{i}. <b>{escape(kw.name)}</b>")
+            if detail:
+                lines.append("    " + escape(" · ".join(detail)))
+
+        lines.append("\n바꾸려면 /set 을 쓰세요.")
+        return "\n".join(lines)
+
+    def _validator(self):
+        from .config import load
+
+        return load
 
     def _pause(self, argument: str) -> str:
         if not argument:

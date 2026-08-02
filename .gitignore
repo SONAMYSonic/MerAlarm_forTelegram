@@ -12,5 +12,10 @@ logs/
 MerAlarm-deploy.tar.gz
 *.tar.gz
 
+# 실행 파일 빌드 결과 (scripts/build_exe.ps1 이 만든다)
+build/
+dist/
+*.spec
+
 __pycache__/
 *.py[cod]

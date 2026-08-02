@@ -4,6 +4,8 @@
 잘못된 값으로 몇 시간 돌다가 조용히 아무 알림도 안 오는 상황이 최악이다.
 """
 
+import shutil
+import sys
 from dataclasses import dataclass
 from datetime import time
 from pathlib import Path
@@ -11,7 +13,20 @@ from typing import Any
 
 import yaml
 
-ROOT = Path(__file__).resolve().parent.parent
+
+def _root() -> Path:
+    """설정과 데이터를 둘 기준 폴더.
+
+    exe 로 묶으면 `__file__` 은 실행할 때마다 새로 풀리는 임시 폴더를 가리킨다.
+    그것을 기준으로 삼으면 설정 파일을 못 찾고, 찾더라도 종료 시 사라진다.
+    묶인 상태에서는 실행 파일이 놓인 폴더를 쓴다.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+ROOT = _root()
 
 
 class ConfigError(RuntimeError):
@@ -49,12 +64,19 @@ class BackoffConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class StoreConfig:
+    keep_days: int
+
+
+@dataclass(frozen=True, slots=True)
 class NotifyConfig:
     show_krw: bool
     price_drop: bool
     batch_threshold: int
     heartbeat_hour: int | None
     error_alert: bool
+    # 키워드가 따로 지정하지 않았을 때 쓰이는 기본값. 표시용으로도 쓴다.
+    max_age_days: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +98,7 @@ class Config:
     poll: PollConfig
     backoff: BackoffConfig
     notify: NotifyConfig
+    store: StoreConfig
     keywords: tuple[KeywordConfig, ...]
     telegram_token: str
     telegram_chat_id: str
@@ -87,7 +110,11 @@ class Config:
 
 def _read_env(path: Path) -> dict[str, str]:
     if not path.exists():
-        raise ConfigError(f"{path} 가 없습니다. .env.example 을 복사해서 만드세요.")
+        raise ConfigError(
+            "텔레그램 설정이 없습니다.\n"
+            "        콘솔 창에서 아래를 실행하면 차례로 안내해 드립니다.\n"
+            "            python -m meralarm --setup"
+        )
     env: dict[str, str] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -202,16 +229,26 @@ def load() -> Config:
     env = _read_env(ROOT / ".env")
     token = env.get("TELEGRAM_BOT_TOKEN")
     chat_id = env.get("TELEGRAM_CHAT_ID")
-    if not token:
-        raise ConfigError(".env 의 TELEGRAM_BOT_TOKEN 이 비어 있습니다.")
-    if not chat_id:
+    if not token or not chat_id:
+        missing = "봇 토큰" if not token else "대화 상대(chat_id)"
         raise ConfigError(
-            ".env 의 TELEGRAM_CHAT_ID 가 비어 있습니다. telegram_check.py 를 실행하면 찾아줍니다."
+            f"{missing} 설정이 비어 있습니다.\n"
+            "        콘솔 창에서 아래를 실행하면 차례로 안내해 드립니다.\n"
+            "            python -m meralarm --setup"
         )
 
     config_path = ROOT / "config.yaml"
     if not config_path.exists():
-        raise ConfigError(f"{config_path} 가 없습니다.")
+        # 배포판에서 실수로 지웠거나 처음 받은 상태일 수 있다. 예시본이 옆에 있으면
+        # 그것으로 시작한다. 없으면 무엇이 없는지 분명히 알려준다.
+        example = ROOT / "config.example.yaml"
+        if example.exists():
+            shutil.copy(example, config_path)
+        else:
+            raise ConfigError(
+                f"설정 파일이 없습니다: {config_path}\n"
+                "        내려받은 폴더에서 config.yaml 을 지우지 않았는지 확인하세요."
+            )
     try:
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     except yaml.YAMLError as e:
@@ -252,6 +289,17 @@ def load() -> Config:
         raise ConfigError(f"keywords 의 name 이 중복됩니다: {names}")
 
     backoff_raw = raw.get("backoff") or {}
+    store_raw = raw.get("store") or {}
+    keep_days = _positive_int(store_raw.get("keep_days", 60), "store.keep_days", 7)
+
+    # 기록을 나이 제한보다 먼저 지우면, 아직 감시 대상인 상품을 신규로 다시 알린다.
+    ages = [k.max_age_days for k in keywords if k.max_age_days is not None]
+    if ages and keep_days <= max(ages):
+        raise ConfigError(
+            f"store.keep_days({keep_days})는 가장 긴 max_age_days({max(ages)})보다 "
+            f"커야 합니다. 그렇지 않으면 아직 감시 중인 상품의 기록이 지워져 "
+            f"이미 알린 상품을 신규로 다시 알립니다."
+        )
 
     heartbeat_hour = notify_raw.get("heartbeat_hour")
     if heartbeat_hour is not None and (
@@ -289,7 +337,9 @@ def load() -> Config:
             ),
             heartbeat_hour=heartbeat_hour,
             error_alert=bool(notify_raw.get("error_alert", True)),
+            max_age_days=default_max_age,
         ),
+        store=StoreConfig(keep_days=keep_days),
         keywords=keywords,
         telegram_token=token,
         telegram_chat_id=chat_id,

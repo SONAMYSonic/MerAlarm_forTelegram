@@ -16,6 +16,7 @@ from .config import Config, ConfigError, load
 from .control import Controls
 from .notifiers.queue import SendQueue
 from .notifiers.telegram import TelegramNotifier
+from . import setup_wizard
 from .scheduler import Scheduler
 from .sources.mercapi_source import MercapiSource
 from .store import SeenStore
@@ -84,6 +85,19 @@ async def run(cfg: Config) -> None:
 
 
 def main() -> None:
+    from .config import ROOT
+
+    env_path = ROOT / ".env"
+    forced = "--setup" in sys.argv
+
+    if forced or setup_wizard.needs_setup(env_path):
+        if setup_wizard.can_prompt():
+            asyncio.run(setup_wizard.run(env_path, ROOT / "config.yaml"))
+        elif forced:
+            sys.exit("설정 마법사는 콘솔 창에서 실행해야 합니다.")
+        # 마법사를 건너뛰었거나 중간에 그만뒀다면 아래 load() 가 무엇이 없는지
+        # 알려주고 끝난다. 여기서 곧바로 종료하면 그 안내를 못 보게 된다.
+
     try:
         cfg = load()
     except ConfigError as e:

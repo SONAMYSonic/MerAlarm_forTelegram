@@ -10,7 +10,7 @@
 """
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .models import Item
@@ -137,6 +137,26 @@ class SeenStore:
             (item.id, item.price, keyword, _now()),
         )
         self._db.commit()
+
+    def purge(self, keep_days: int) -> tuple[int, int]:
+        """오래 보이지 않은 기록을 지운다. (items, notified) 삭제 건수를 돌려준다.
+
+        팔렸거나 내려간 상품은 검색에 다시 나오지 않으므로 기록만 쌓인다.
+        아직 팔리지 않은 상품은 매 회차 last_seen 이 갱신되어 지워지지 않는다.
+
+        keep_days 는 나이 필터(max_age_days)보다 넉넉해야 한다. 그보다 짧으면
+        아직 감시 대상인 상품의 기록을 지워 신규로 다시 알리게 된다.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat(
+            timespec="seconds"
+        )
+        # 두 표 모두 _now() 가 만든 같은 형식의 UTC 문자열이라 사전순 비교가 성립한다.
+        items = self._db.execute("DELETE FROM items WHERE last_seen < ?", (cutoff,)).rowcount
+        notified = self._db.execute(
+            "DELETE FROM notified WHERE notified_at < ?", (cutoff,)
+        ).rowcount
+        self._db.commit()
+        return items, notified
 
     def count(self, keyword: str) -> int:
         return self._db.execute(

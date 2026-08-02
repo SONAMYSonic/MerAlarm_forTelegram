@@ -77,6 +77,7 @@ class Scheduler:
         self._krw_rate: float | None = None
         self._rate_date: date | None = None
         self._heartbeat_date: date | None = None
+        self._purge_date: date | None = None
         self.stats = Stats()
 
     # ---- 바깥에서 조작하는 부분 ----
@@ -159,7 +160,11 @@ class Scheduler:
             self._store.mark_notified(keyword, item)
 
     def _drop_duplicates(
-        self, kw: KeywordConfig, items: list[Item], new: list[Item], drops: list[tuple[Item, int]]
+        self,
+        kw: KeywordConfig,
+        ledger: dict[str, int],
+        new: list[Item],
+        drops: list[tuple[Item, int]],
     ) -> tuple[list[Item], list[tuple[Item, int]]]:
         """다른 키워드로 이미 알린 상품을 걸러낸다.
 
@@ -167,7 +172,6 @@ class Scheduler:
         흔하다. items 표는 키워드별로 나뉘어 있어 그대로 두면 같은 물건으로 알림이
         두세 번 간다.
         """
-        ledger = self._store.notified_prices([i.id for i in items])
         if not ledger:
             return new, drops
 
@@ -253,7 +257,11 @@ class Scheduler:
             return
 
         total = len(items)
-        items = filters.apply(items, kw)
+
+        # 이미 알린 적 있는 상품은 나이를 따지지 않는다. 30일이 지났다는 이유로
+        # 추적을 놓아버리면, 알려드린 물건이 싸져도 알리지 못한다.
+        ledger = self._store.notified_prices([i.id for i in items])
+        items = filters.apply(items, kw, age_exempt=set(ledger))
         if not items:
             log.info("[%s] %d건 중 조건에 맞는 상품 없음", kw.name, total)
             return
@@ -272,7 +280,7 @@ class Scheduler:
         new, drops = self._diff(kw, items)
         if not self._cfg.notify.price_drop:
             drops = []
-        new, drops = self._drop_duplicates(kw, items, new, drops)
+        new, drops = self._drop_duplicates(kw, ledger, new, drops)
 
         # 알림 대상이 아닌 상품은 곧바로 기록을 갱신한다. 가격이 오른 경우도 여기
         # 포함되며, 그래야 다음 인하를 오른 가격 기준으로 계산한다.
@@ -359,6 +367,25 @@ class Scheduler:
         self._krw_rate = await fx.jpy_to_krw(self._cfg.fx_cache_path)
         self._rate_date = today
 
+    def _maybe_purge(self) -> None:
+        """하루 한 번 오래된 기록을 정리한다. 안 하면 DB가 계속 자란다."""
+        today = date.today()
+        if self._purge_date == today:
+            return
+        self._purge_date = today
+        try:
+            items, notified = self._store.purge(self._cfg.store.keep_days)
+        except Exception:
+            log.exception("기록 정리 실패. 감시는 계속합니다")
+            return
+        if items or notified:
+            log.info(
+                "%d일 넘게 보이지 않은 기록 정리: 상품 %d건 · 알림 원장 %d건",
+                self._cfg.store.keep_days,
+                items,
+                notified,
+            )
+
     def _maybe_heartbeat(self) -> None:
         hour = self._cfg.notify.heartbeat_hour
         if hour is None:
@@ -403,6 +430,7 @@ class Scheduler:
                 continue
 
             await self._refresh_rate()
+            self._maybe_purge()
             self._maybe_heartbeat()
 
             now = time.monotonic()
