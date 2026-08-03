@@ -99,6 +99,12 @@ logs\         실행 기록. 문제가 생기면 여기를 보세요
 "@ | Out-File "$out\사용법.txt" -Encoding UTF8
 
 Write-Output "== 압축 =="
+# 실행해 보고 나서 다시 압축하는 경우가 있다. 그때 생긴 것들이 배포본에
+# 섞이면 받는 사람이 남의 기록과 잠금 파일을 함께 받게 된다.
+foreach ($junk in @(".env", ".meralarm.lock", "data", "logs")) {
+    Remove-Item (Join-Path $out $junk) -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 # 파일 이름에 버전을 넣어야 받은 사람이 무엇을 갖고 있는지 알 수 있다.
 $version = (Select-String -Path "meralarm\__init__.py" -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
 $zip = "dist\MerAlarm-v$version.zip"
