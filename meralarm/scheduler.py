@@ -258,10 +258,9 @@ class Scheduler:
 
         total = len(items)
 
-        # 이미 알린 적 있는 상품은 나이를 따지지 않는다. 30일이 지났다는 이유로
-        # 추적을 놓아버리면, 알려드린 물건이 싸져도 알리지 못한다.
-        ledger = self._store.notified_prices([i.id for i in items])
-        items = filters.apply(items, kw, age_exempt=set(ledger))
+        # 나이 제한은 "신규라고 알릴지"를 정하는 조건이지 "쳐다볼지"가 아니다.
+        # 오래된 상품도 가격을 기록해 두어야 나중에 값을 내렸을 때 알아챈다.
+        items = filters.apply(items, kw, ignore_age=True)
         if not items:
             log.info("[%s] %d건 중 조건에 맞는 상품 없음", kw.name, total)
             return
@@ -280,7 +279,15 @@ class Scheduler:
         new, drops = self._diff(kw, items)
         if not self._cfg.notify.price_drop:
             drops = []
+        ledger = self._store.notified_prices([i.id for i in items])
         new, drops = self._drop_duplicates(kw, ledger, new, drops)
+
+        # 처음 본 상품 중 출품한 지 오래된 것은 알리지 않는다. 갱신만으로 상위에
+        # 떠오른 것을 새 물건이라고 알리면 거짓말이 되기 때문이다. 대신 기록은
+        # 남겨서, 나중에 값을 내리면 그때 알린다.
+        alertable = [i for i in new if filters.matches(i, kw)]
+        quiet = len(new) - len(alertable)
+        new = alertable
 
         # 알림 대상이 아닌 상품은 곧바로 기록을 갱신한다. 가격이 오른 경우도 여기
         # 포함되며, 그래야 다음 인하를 오른 가격 기준으로 계산한다.
@@ -288,7 +295,13 @@ class Scheduler:
         self._store.record(kw.name, [i for i in items if i.id not in pending])
 
         if not new and not drops:
-            log.info("[%s] 변화 없음 (%d/%d건 확인)", kw.name, len(items), total)
+            log.info(
+                "[%s] 변화 없음 (%d/%d건 확인%s)",
+                kw.name,
+                len(items),
+                total,
+                f" · 오래된 신규 {quiet}건 조용히 기록" if quiet else "",
+            )
             return
 
         if new:
