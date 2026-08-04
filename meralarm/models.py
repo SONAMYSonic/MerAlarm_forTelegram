@@ -54,6 +54,18 @@ class Item:
         return max(0, (datetime.now() - self.created).days)
 
     @property
+    def bump_days(self) -> int:
+        """출품하고 며칠이 지나서 갱신됐는가.
+
+        0 이면 올린 뒤 손대지 않은 물건이고, 크면 한참 안 팔리다가 끌어올린 것이다.
+        "오래된 상품인가"(age_days)와는 다른 질문이다. 5일 전에 올려두고 그대로인
+        물건은 age 5 · bump 0 이지만, 5일 전에 올리고 오늘 끌어올린 물건은
+        age 5 · bump 5 다. 앞쪽은 우리가 늦게 발견한 새 매물이고, 뒤쪽은 이미
+        있던 물건이 위로 떠오른 것이다.
+        """
+        return max(0, (self.updated - self.created).days)
+
+    @property
     def url(self) -> str:
         # Shops 상품을 /item/ 으로 만들면 404 가 뜬다. 검색 결과의 5% 정도가
         # Shops 라서 링크 절반쯤은 멀쩡해 보여도 나머지는 열리지 않는다.

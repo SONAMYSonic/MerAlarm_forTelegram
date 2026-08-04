@@ -77,6 +77,7 @@ class NotifyConfig:
     error_alert: bool
     # 키워드가 따로 지정하지 않았을 때 쓰이는 기본값. 표시용으로도 쓴다.
     max_age_days: int | None
+    max_bump_days: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +92,8 @@ class KeywordConfig:
     shipping_payers: tuple[int, ...]
     # 출품한 지 이만큼 지난 상품은 알리지 않는다. None 이면 제한 없음.
     max_age_days: int | None
+    # 출품 후 이만큼 지나서 갱신된 상품(끌어올린 것)은 신규로 알리지 않는다.
+    max_bump_days: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,16 +180,23 @@ def _positive_int(value: Any, where: str, minimum: int) -> int:
     return value
 
 
-def _optional_age(value: Any, where: str) -> int | None:
+def _optional_age(value: Any, where: str, minimum: int = 1) -> int | None:
+    """일수 설정. `minimum=0` 은 끌어올림처럼 0이 뜻을 갖는 항목에 쓴다."""
     if value is None:
         return None
-    if not isinstance(value, int) or value < 1:
-        raise ConfigError(f"{where} 는 1 이상의 정수 또는 null 이어야 합니다. 받은 값: {value!r}")
+    if not isinstance(value, int) or value < minimum:
+        raise ConfigError(
+            f"{where} 는 {minimum} 이상의 정수 또는 null 이어야 합니다. 받은 값: {value!r}"
+        )
     return value
 
 
 def _parse_keyword(
-    raw: Any, index: int, default_interval: int, default_max_age: int | None
+    raw: Any,
+    index: int,
+    default_interval: int,
+    default_max_age: int | None,
+    default_max_bump: int | None,
 ) -> KeywordConfig:
     where = f"keywords[{index}]"
 
@@ -204,6 +214,7 @@ def _parse_keyword(
             conditions=(),
             shipping_payers=(),
             max_age_days=default_max_age,
+            max_bump_days=default_max_bump,
         )
 
     if not isinstance(raw, dict):
@@ -244,6 +255,9 @@ def _parse_keyword(
         ),
         max_age_days=_optional_age(
             raw.get("max_age_days", default_max_age), f"{where}.max_age_days"
+        ),
+        max_bump_days=_optional_age(
+            raw.get("max_bump_days", default_max_bump), f"{where}.max_bump_days", minimum=0
         ),
     )
 
@@ -300,12 +314,16 @@ def load() -> Config:
     default_max_age = _optional_age(
         notify_raw.get("max_age_days"), "notify.max_age_days"
     )
+    # 0 이면 "출품 당일에 갱신된 것까지만 새 매물로 친다"는 뜻이라 유효하다.
+    default_max_bump = _optional_age(
+        notify_raw.get("max_bump_days"), "notify.max_bump_days", minimum=0
+    )
 
     keywords_raw = raw.get("keywords") or []
     if not isinstance(keywords_raw, list) or not keywords_raw:
         raise ConfigError("config.yaml 의 keywords 가 비어 있습니다.")
     keywords = tuple(
-        _parse_keyword(entry, i, default_interval, default_max_age)
+        _parse_keyword(entry, i, default_interval, default_max_age, default_max_bump)
         for i, entry in enumerate(keywords_raw)
     )
     names = [k.name for k in keywords]
@@ -362,6 +380,7 @@ def load() -> Config:
             heartbeat_hour=heartbeat_hour,
             error_alert=bool(notify_raw.get("error_alert", True)),
             max_age_days=default_max_age,
+            max_bump_days=default_max_bump,
         ),
         store=StoreConfig(keep_days=keep_days),
         keywords=keywords,

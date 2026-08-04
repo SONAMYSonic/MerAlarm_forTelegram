@@ -258,9 +258,9 @@ class Scheduler:
 
         total = len(items)
 
-        # 나이 제한은 "신규라고 알릴지"를 정하는 조건이지 "쳐다볼지"가 아니다.
-        # 오래된 상품도 가격을 기록해 두어야 나중에 값을 내렸을 때 알아챈다.
-        items = filters.apply(items, kw, ignore_age=True)
+        # 출품 경과일·끌어올림은 "신규라고 알릴지"를 정하는 조건이지 "쳐다볼지"가
+        # 아니다. 걸러질 상품도 가격을 기록해 두어야 값을 내렸을 때 알아챈다.
+        items = filters.apply(items, kw, ignore_freshness=True)
         if not items:
             log.info("[%s] %d건 중 조건에 맞는 상품 없음", kw.name, total)
             return
@@ -282,9 +282,9 @@ class Scheduler:
         ledger = self._store.notified_prices([i.id for i in items])
         new, drops = self._drop_duplicates(kw, ledger, new, drops)
 
-        # 처음 본 상품 중 출품한 지 오래된 것은 알리지 않는다. 갱신만으로 상위에
-        # 떠오른 것을 새 물건이라고 알리면 거짓말이 되기 때문이다. 대신 기록은
-        # 남겨서, 나중에 값을 내리면 그때 알린다.
+        # 처음 본 상품 중 오래됐거나 끌어올린 것은 신규로 알리지 않는다. 갱신만으로
+        # 상위에 떠오른 것을 새 물건이라고 알리면 거짓말이 되기 때문이다. 대신
+        # 기록은 남겨서, 나중에 값을 내리면 그때 알린다.
         alertable = [i for i in new if filters.matches(i, kw)]
         quiet = len(new) - len(alertable)
         new = alertable

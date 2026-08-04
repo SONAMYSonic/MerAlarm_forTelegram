@@ -54,8 +54,15 @@ HELP = """<b>MerAlarm 명령어</b>
 
 <code>/set interval 60</code> — 감시 주기(초)
 <code>/set age 7</code> — 출품 7일 이내만
+<code>/set bump 0</code> — 끌어올린 상품은 신규로 안 침
 <code>/set krw off</code> — 원화 환산 끄기
 <code>/set 2 price_max 50000</code> — 2번 키워드만 가격 상한
+
+<b>age 와 bump 의 차이</b>
+age 는 "출품한 지 며칠 됐나", bump 는 "출품하고 며칠 뒤에 갱신됐나"입니다.
+5일 전에 올려두고 그대로인 물건은 age 5 · bump 0 (늦게 발견한 새 매물),
+5일 전에 올리고 오늘 끌어올린 물건은 age 5 · bump 5 (이미 있던 물건)입니다.
+둘 다 <b>신규 알림에만</b> 적용되고, 걸러져도 값을 내리면 알려드립니다.
 
 항목 목록은 <code>/set</code> 만 쳐도 나옵니다.
 
@@ -156,6 +163,7 @@ GLOBAL_SETTINGS = {
     "interval": (("poll", "default_interval_sec"), "감시 주기(초)", _ranged("주기", 10, 3600)),
     "gap": (("poll", "min_request_gap_sec"), "요청 간 최소 간격(초)", _ranged("간격", 1, 60)),
     "age": (("notify", "max_age_days"), "출품 경과일 제한(일)", _ranged("경과일", 1, 3650, True)),
+    "bump": (("notify", "max_bump_days"), "끌어올림 허용(일)", _ranged("일수", 0, 3650, True)),
     "batch": (("notify", "batch_threshold"), "묶음 요약 기준(건)", _ranged("기준", 2, 100)),
     "krw": (("notify", "show_krw"), "원화 환산", _switch),
     "drop": (("notify", "price_drop"), "가격 인하 알림", _switch),
@@ -170,6 +178,7 @@ KEYWORD_SETTINGS = {
     "price_min": ("price_min", "최저 가격(엔)", _ranged("가격", 0, 100_000_000, True)),
     "price_max": ("price_max", "최고 가격(엔)", _ranged("가격", 0, 100_000_000, True)),
     "age": ("max_age_days", "출품 경과일 제한(일)", _ranged("경과일", 1, 3650, True)),
+    "bump": ("max_bump_days", "끌어올림 허용(일)", _ranged("일수", 0, 3650, True)),
 }
 
 
@@ -458,6 +467,8 @@ class CommandListener:
             f"(요청 간격 {cfg.poll.min_request_gap_sec:g}초)",
             f"· 출품 경과일 제한 {self._show(cfg.notify.max_age_days)}"
             + ("일" if cfg.notify.max_age_days is not None else ""),
+            f"· 끌어올림 허용 {self._show(cfg.notify.max_bump_days)}"
+            + ("일" if cfg.notify.max_bump_days is not None else ""),
             f"· 묶음 요약 기준 <b>{cfg.notify.batch_threshold}건</b>",
             f"· 원화 환산 {self._show(cfg.notify.show_krw)}"
             f" · 인하 알림 {self._show(cfg.notify.price_drop)}",
