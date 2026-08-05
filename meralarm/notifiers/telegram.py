@@ -18,6 +18,13 @@ from ..models import Item
 API = "https://api.telegram.org/bot{token}/{method}"
 MAX_ATTEMPTS = 3
 
+# 텔레그램이 거부하는 길이. 넘으면 그 알림은 통째로 못 간다. 그리고 전송에 실패하면
+# 기록이 안 남아 다음 회차에 같은 것을 또 만들어 또 실패한다 — 그 키워드의 알림이
+# 영영 막히므로 보내기 전에 반드시 줄여야 한다.
+TEXT_LIMIT = 4096
+CAPTION_LIMIT = 1024  # 사진에 붙는 글은 훨씬 빡빡하다
+NAME_LIMIT = 120      # 상품명이 길어도 나머지 정보가 밀리지 않게
+
 log = logging.getLogger(__name__)
 
 
@@ -32,13 +39,17 @@ def _origin(item: Item) -> str:
     return " · 🏪 Shops" if item.is_shops else ""
 
 
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 def _new_text(alert: Alert) -> str:
     item = alert.item
     mark, aged = alerts.headline(item)
     head = f"{mark} <b>#{_tag(alert.keyword)}</b>" + (f" · {aged}" if aged else "")
     return (
         f"{head}\n\n"
-        f"{escape(item.name)}\n\n"
+        f"{escape(_clip(item.name, NAME_LIMIT))}\n\n"
         f"💴 <b>{alerts.price_text(item, alert.krw_rate)}</b>\n"
         f"📦 {item.condition} · 배송비 {item.shipping_payer}{_origin(item)}\n"
         f"🕒 {item.created:%Y-%m-%d %H:%M} 출품\n\n"
@@ -52,7 +63,7 @@ def _drop_text(alert: Alert) -> str:
     percent = cut / alert.old_price * 100
     return (
         f"📉 <b>#{_tag(alert.keyword)}</b> 가격 인하\n\n"
-        f"{escape(item.name)}\n\n"
+        f"{escape(_clip(item.name, NAME_LIMIT))}\n\n"
         f"💴 <s>¥{alert.old_price:,}</s> → <b>{alerts.price_text(item, alert.krw_rate)}</b>\n"
         f"🔻 ¥{cut:,} 내림 ({percent:.0f}%)\n"
         f"📦 {item.condition} · 배송비 {item.shipping_payer}{_origin(item)}\n\n"
@@ -61,12 +72,24 @@ def _drop_text(alert: Alert) -> str:
 
 
 def _batch_text(alert: Alert) -> str:
-    lines = [f"🆕 <b>#{_tag(alert.keyword)}</b> 신규 {len(alert.items)}건\n"]
+    total = len(alert.items)
+    head = f"🆕 <b>#{_tag(alert.keyword)}</b> 신규 {total}건\n"
+    lines, shown = [head], 0
+
     for item in alert.items:
-        lines.append(
-            f'· <a href="{item.url}">{escape(item.name[:45])}</a>\n'
+        entry = (
+            f'· <a href="{item.url}">{escape(_clip(item.name, 45))}</a>\n'
             f"  {alerts.price_text(item, alert.krw_rate)} · {item.condition}"
         )
+        # 다 넣으면 넘칠 것 같으면 거기서 멈춘다. 넘긴 채로 보내면 텔레그램이
+        # 통째로 거부해서 한 건도 전달되지 않는다.
+        tail = f"\n\n<i>외 {total - shown}건</i>"
+        if sum(len(x) + 1 for x in lines) + len(entry) + len(tail) > TEXT_LIMIT:
+            lines.append(f"\n<i>외 {total - shown}건은 목록이 길어 생략했습니다</i>")
+            break
+        lines.append(entry)
+        shown += 1
+
     return "\n".join(lines)
 
 
@@ -92,6 +115,9 @@ class TelegramNotifier:
 
     async def send(self, alert: Alert) -> bool:
         text, photo = self.render(alert)
+        # 마지막 안전망. 어떤 경로로든 한도를 넘으면 잘라서라도 보낸다.
+        # 못 보내는 것보다 줄여서 보내는 편이 낫다.
+        text = _clip(text, CAPTION_LIMIT if photo else TEXT_LIMIT)
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
                 response = await self._post(text, photo)

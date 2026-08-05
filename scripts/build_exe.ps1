@@ -47,6 +47,21 @@ Move-Item "dist\MerAlarm.exe" "$out\MerAlarm.exe" -Force
 Copy-Item "config.example.yaml" "$out\config.yaml"
 Copy-Item "config.example.yaml" "$out\config.example.yaml"
 
+# --setup 은 명령줄 옵션이라 더블클릭으로는 실행할 수 없다. 설정을 다시 하거나
+# 디스코드를 연결하려는 사람이 명령 프롬프트를 열게 만들 수는 없으므로 배치 파일로 싼다.
+#
+# 배치 파일은 줄바꿈이 반드시 CRLF 여야 한다. LF 로 두면 cmd 가 줄을 제대로 나누지
+# 못해 "MerAlarm.exe 를 찾을 수 없습니다" 로 끝난다. ps1 이나 sh 와 달리 여기만 그렇다.
+$bat = @'
+@echo off
+cd /d "%~dp0"
+"%~dp0MerAlarm.exe" --setup
+echo.
+pause
+'@ -replace "`r?`n", "`r`n"
+[System.IO.File]::WriteAllText(
+    (Join-Path $out "설정 다시하기.bat"), $bat, [System.Text.Encoding]::ASCII)
+
 @"
 MerAlarm - 메루카리 키워드 알리미
 ====================================
@@ -71,6 +86,18 @@ MerAlarm - 메루카리 키워드 알리미
   /set interval 60    감시 주기 바꾸기(초)
   /pause  /resume     잠시 멈추기 / 다시 시작
   /status             잘 돌고 있는지 확인
+
+디스코드로도 받고 싶다면
+------------------------
+1. 디스코드에서 알림 받을 채널의 톱니(채널 편집)를 누릅니다
+2. 왼쪽 메뉴에서 "연동" -> "웹후크" -> "새 웹후크"
+3. "웹후크 URL 복사" 를 누릅니다
+4. 이 폴더의 "설정 다시하기.bat" 을 두 번 누릅니다
+5. 디스코드를 물어볼 때 복사한 주소를 붙여넣습니다
+
+텔레그램과 디스코드로 동시에 알림이 옵니다.
+키워드 추가 같은 명령은 계속 텔레그램에서 합니다.
+(디스코드 웹후크는 보내기 전용이라 명령을 받을 수 없습니다)
 
 끄는 법
 -------

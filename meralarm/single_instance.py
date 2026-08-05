@@ -34,6 +34,10 @@ class SingleInstance:
             if sys.platform == "win32":
                 import msvcrt
 
+                # 잠금은 "현재 위치부터" 걸린다. "a+" 로 열면 위치가 파일 끝이라,
+                # 파일에 내용이 생기면 두 프로세스가 서로 다른 바이트를 잠가
+                # 중복 실행을 못 막는다. 항상 같은 자리를 잠그도록 맨 앞으로 옮긴다.
+                handle.seek(0)
                 msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
             else:
                 import fcntl

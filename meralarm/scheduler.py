@@ -132,6 +132,8 @@ class Scheduler:
     def _stagger(self) -> None:
         now = time.monotonic()
         count = len(self._states)
+        if not count:
+            return
         for index, state in enumerate(self._states):
             state.next_run = now + self._effective_interval(state) * index / count
 
@@ -377,7 +379,12 @@ class Scheduler:
         today = date.today()
         if self._rate_date == today:
             return
-        self._krw_rate = await fx.jpy_to_krw(self._cfg.fx_cache_path)
+        rate = await fx.jpy_to_krw(self._cfg.fx_cache_path)
+        if rate is None:
+            # 오늘 것으로 표시해 두면 환율 서버가 잠깐 죽었을 때 하루 종일
+            # 원화 표시가 사라진다. 성공했을 때만 오늘 몫을 마쳤다고 본다.
+            return
+        self._krw_rate = rate
         self._rate_date = today
 
     def _maybe_purge(self) -> None:
