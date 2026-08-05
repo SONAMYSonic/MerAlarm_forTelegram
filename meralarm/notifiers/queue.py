@@ -29,6 +29,19 @@ class SendQueue:
     def channels(self) -> list[str]:
         return [n.name for n in self._notifiers]
 
+    @property
+    def notifiers(self) -> list:
+        """종료할 때 정리하려고 꺼내 본다."""
+        return list(self._notifiers)
+
+    def add(self, notifier) -> None:
+        """채널을 나중에 붙인다.
+
+        디스코드 봇은 명령 코어를 들고 있어야 하는데, 그 코어는 스케줄러를,
+        스케줄러는 이 큐를 필요로 한다. 그래서 봇만 큐보다 늦게 만들어진다.
+        """
+        self._notifiers.append(notifier)
+
     def put(self, alert: Alert) -> None:
         try:
             self._queue.put_nowait(alert)

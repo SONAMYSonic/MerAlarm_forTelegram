@@ -1,11 +1,19 @@
-"""텔레그램 봇 명령어.
+"""봇 명령어.
 
 화면 없는 서버에서는 트레이 아이콘을 쓸 수 없어, 설정을 바꾸려면 SSH 로 들어가
 config.yaml 을 고치고 재시작해야 한다. 그 대신 알림을 받는 그 자리에서 키워드를
 넣고 빼고 잠시 멈출 수 있게 한다.
 
-받은 메시지는 설정된 chat_id 에서 온 것만 처리한다. 봇 이름은 검색으로 노출되므로
-누구나 말을 걸 수 있고, 그대로 두면 남이 내 감시 설정을 바꿀 수 있다.
+두 갈래로 나뉘어 있다.
+
+    CommandCore       무엇을 하는지. 어느 채널에서 왔는지 모른다
+    TelegramCommands  텔레그램에서 받아오는 방법 (롱 폴링)
+
+디스코드 쪽 받아오기는 `notifiers/discord_bot.py` 에 있고 같은 코어를 쓴다.
+명령 하나를 늘리려면 코어만 고치면 두 채널에 동시에 생긴다.
+
+**어느 채널이든 주인이 보낸 것만 처리한다.** 봇은 검색이나 서버 목록으로
+노출되므로 누구나 말을 걸 수 있고, 그대로 두면 남이 내 감시 설정을 바꾼다.
 """
 
 import asyncio
@@ -200,91 +208,32 @@ def _humanize(seconds: float) -> str:
     return f"{minutes}분" if minutes else f"{int(seconds)}초"
 
 
-class CommandListener:
-    def __init__(
-        self,
-        cfg: Config,
-        controls: Controls,
-        scheduler: Scheduler,
-        queue: SendQueue,
-    ) -> None:
+class CommandCore:
+    """명령을 해석하고 실행한다. 어느 채널에서 온 명령인지는 모른다.
+
+    답장은 텔레그램 HTML 로 쓴다. 디스코드로 갈 때는 `notifiers/markup.py` 가
+    마크다운으로 바꾼다. 채널마다 문구를 따로 두면 한쪽만 고치는 일이 생긴다.
+    """
+
+    def __init__(self, cfg: Config, controls: Controls, scheduler: Scheduler) -> None:
         self._cfg = cfg
         self._controls = controls
         self._scheduler = scheduler
-        self._queue = queue
         self._store = KeywordStore(cfg.config_path)
-        self._offset = 0
-        # 알림 전송과 별개의 연결을 쓴다. 롱 폴링이 전송을 붙잡고 있으면 안 된다.
-        self._client = httpx.AsyncClient(timeout=POLL_TIMEOUT + 15)
 
-    # ---- 롱 폴링 ----
+    def dispatch(self, text: str) -> str:
+        """명령 한 줄을 받아 답장을 돌려준다.
 
-    async def run(self) -> None:
-        log.info("명령어 수신 대기 시작. /help 로 사용법을 볼 수 있습니다")
-        await self._skip_backlog()
-        while True:
-            try:
-                updates = await self._fetch()
-            except Exception as e:
-                # 같은 토큰으로 두 곳에서 동시에 받으면 텔레그램이 한쪽을 끊는다.
-                # 흔한 실수라 원문을 그대로 남겨야 원인을 알 수 있다.
-                hint = ""
-                if "conflict" in str(e).lower():
-                    hint = " — 같은 봇을 두 곳에서 돌리고 있지 않은지 확인하세요"
-                log.warning("명령어 수신 실패: %s%s. 10초 뒤 재시도", e, hint)
-                await asyncio.sleep(10)
-                continue
-            for update in updates:
-                await self._on_update(update)
-
-    async def _skip_backlog(self) -> None:
-        """켜져 있지 않던 동안 쌓인 메시지는 버린다. 옛 명령이 뒤늦게 실행되면 곤란하다."""
+        여기서 예외를 삼키는 것은 채널을 붙일 때마다 같은 try 를 다시 쓰지
+        않기 위해서다. 명령 하나가 터졌다고 수신 자체가 멈추면 안 된다.
+        """
         try:
-            updates = await self._fetch(timeout=0)
-            if updates:
-                log.info("대기 중이던 메시지 %d건을 건너뜁니다", len(updates))
-        except Exception:
-            pass
-
-    async def _fetch(self, timeout: int = POLL_TIMEOUT) -> list[dict]:
-        response = await self._client.get(
-            API.format(token=self._cfg.telegram_token, method="getUpdates"),
-            params={"offset": self._offset, "timeout": timeout},
-        )
-        body = response.json()
-        if not body.get("ok"):
-            raise RuntimeError(body.get("description", "알 수 없는 오류"))
-        updates = body.get("result", [])
-        if updates:
-            self._offset = updates[-1]["update_id"] + 1
-        return updates
-
-    async def _on_update(self, update: dict) -> None:
-        message = update.get("message") or update.get("edited_message")
-        if not message:
-            return
-        text = (message.get("text") or "").strip()
-        if not text.startswith("/"):
-            return
-
-        sender = str(message.get("chat", {}).get("id", ""))
-        if sender != str(self._cfg.telegram_chat_id):
-            log.warning("허용되지 않은 chat_id(%s)의 명령을 무시했습니다: %s", sender, text[:40])
-            return
-
-        log.info("명령 수신: %s", text[:60])
-        try:
-            reply = self._dispatch(text)
+            return self._route(text)
         except Exception:
             log.exception("명령 처리 중 오류")
-            reply = "⚠️ 처리 중 오류가 났습니다. 로그를 확인하세요."
-        # 명령 응답은 물어본 곳에만 간다. 디스코드에 텔레그램 명령 결과가 뜨면
-        # 왜 뜨는지 알 수 없다.
-        self._queue.put(raw(reply, only="telegram"))
+            return "⚠️ 처리 중 오류가 났습니다. 로그를 확인하세요."
 
-    # ---- 명령 처리 ----
-
-    def _dispatch(self, text: str) -> str:
+    def _route(self, text: str) -> str:
         parts = text.split(maxsplit=1)
         # 그룹에서는 /add@봇이름 형태로 온다.
         command = parts[0].split("@")[0].lower()
@@ -532,6 +481,79 @@ class CommandListener:
             return False
         self._scheduler.reload_keywords(fresh.keywords)
         return True
+
+
+class TelegramCommands:
+    """텔레그램에서 명령을 받아 코어에 넘기고 답장을 큐에 넣는다.
+
+    받아오는 방법만 텔레그램의 것이고, 무엇을 하는지는 전부 `CommandCore` 에 있다.
+    """
+
+    def __init__(self, cfg: Config, core: CommandCore, queue: SendQueue) -> None:
+        self._cfg = cfg
+        self._core = core
+        self._queue = queue
+        self._offset = 0
+        # 알림 전송과 별개의 연결을 쓴다. 롱 폴링이 전송을 붙잡고 있으면 안 된다.
+        self._client = httpx.AsyncClient(timeout=POLL_TIMEOUT + 15)
+
+    async def run(self) -> None:
+        log.info("텔레그램 명령어 수신 대기 시작. /help 로 사용법을 볼 수 있습니다")
+        await self._skip_backlog()
+        while True:
+            try:
+                updates = await self._fetch()
+            except Exception as e:
+                # 같은 토큰으로 두 곳에서 동시에 받으면 텔레그램이 한쪽을 끊는다.
+                # 흔한 실수라 원문을 그대로 남겨야 원인을 알 수 있다.
+                hint = ""
+                if "conflict" in str(e).lower():
+                    hint = " — 같은 봇을 두 곳에서 돌리고 있지 않은지 확인하세요"
+                log.warning("명령어 수신 실패: %s%s. 10초 뒤 재시도", e, hint)
+                await asyncio.sleep(10)
+                continue
+            for update in updates:
+                self._on_update(update)
+
+    async def _skip_backlog(self) -> None:
+        """켜져 있지 않던 동안 쌓인 메시지는 버린다. 옛 명령이 뒤늦게 실행되면 곤란하다."""
+        try:
+            updates = await self._fetch(timeout=0)
+            if updates:
+                log.info("대기 중이던 메시지 %d건을 건너뜁니다", len(updates))
+        except Exception:
+            pass
+
+    async def _fetch(self, timeout: int = POLL_TIMEOUT) -> list[dict]:
+        response = await self._client.get(
+            API.format(token=self._cfg.telegram_token, method="getUpdates"),
+            params={"offset": self._offset, "timeout": timeout},
+        )
+        body = response.json()
+        if not body.get("ok"):
+            raise RuntimeError(body.get("description", "알 수 없는 오류"))
+        updates = body.get("result", [])
+        if updates:
+            self._offset = updates[-1]["update_id"] + 1
+        return updates
+
+    def _on_update(self, update: dict) -> None:
+        message = update.get("message") or update.get("edited_message")
+        if not message:
+            return
+        text = (message.get("text") or "").strip()
+        if not text.startswith("/"):
+            return
+
+        sender = str(message.get("chat", {}).get("id", ""))
+        if sender != str(self._cfg.telegram_chat_id):
+            log.warning("허용되지 않은 chat_id(%s)의 명령을 무시했습니다: %s", sender, text[:40])
+            return
+
+        log.info("텔레그램 명령 수신: %s", text[:60])
+        # 명령 응답은 물어본 곳에만 간다. 디스코드에 텔레그램 명령 결과가 뜨면
+        # 왜 뜨는지 알 수 없다.
+        self._queue.put(raw(self._core.dispatch(text), only="telegram"))
 
     async def close(self) -> None:
         await self._client.aclose()

@@ -103,14 +103,32 @@ class Config:
     notify: NotifyConfig
     store: StoreConfig
     keywords: tuple[KeywordConfig, ...]
+    # 채널은 하나만 있어도 된다. 비어 있는 쪽은 그냥 쓰지 않는다.
     telegram_token: str
     telegram_chat_id: str
-    # 비어 있으면 디스코드로는 보내지 않는다. 텔레그램만으로도 완전히 동작한다.
     discord_webhook: str
+    # 봇은 알림과 명령을 모두 한다. 토큰이 있으면 웹훅 대신 이쪽을 쓴다.
+    discord_bot_token: str
+    discord_channel_id: int
+    discord_owner_id: int
     config_path: Path
     db_path: Path
     log_path: Path
     fx_cache_path: Path
+
+    @property
+    def has_telegram(self) -> bool:
+        return bool(self.telegram_token and self.telegram_chat_id)
+
+    @property
+    def has_discord_bot(self) -> bool:
+        return bool(self.discord_bot_token and self.discord_channel_id)
+
+
+SETUP_HINT = (
+    "        콘솔 창에서 아래를 실행하면 차례로 안내해 드립니다.\n"
+    "            python -m meralarm --setup"
+)
 
 
 def ensure_writable(root: Path = ROOT) -> None:
@@ -136,11 +154,7 @@ def ensure_writable(root: Path = ROOT) -> None:
 
 def _read_env(path: Path) -> dict[str, str]:
     if not path.exists():
-        raise ConfigError(
-            "텔레그램 설정이 없습니다.\n"
-            "        콘솔 창에서 아래를 실행하면 차례로 안내해 드립니다.\n"
-            "            python -m meralarm --setup"
-        )
+        raise ConfigError("알림을 받을 곳이 설정되지 않았습니다.\n" + SETUP_HINT)
     env: dict[str, str] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -262,18 +276,58 @@ def _parse_keyword(
     )
 
 
+def _snowflake(value: str, where: str) -> int:
+    """디스코드의 채널·사용자 번호. 숫자만 들어 있다."""
+    if not value.isdigit():
+        raise ConfigError(f"{where} 는 숫자여야 합니다. 받은 값: {value!r}\n" + SETUP_HINT)
+    return int(value)
+
+
+def _channels(env: dict[str, str]) -> tuple[str, str, str, str, int, int]:
+    """알림 채널 설정을 읽고 검증한다.
+
+    예전에는 텔레그램이 없으면 무조건 거절했다. 디스코드 봇 하나로도 알림과 명령이
+    모두 되므로 지금은 **하나도 없을 때만** 거절한다.
+    """
+    telegram_token = env.get("TELEGRAM_BOT_TOKEN", "").strip()
+    telegram_chat_id = env.get("TELEGRAM_CHAT_ID", "").strip()
+    # 반쪽만 있으면 조용히 텔레그램을 빼먹지 말고 무엇이 빠졌는지 알려준다.
+    if bool(telegram_token) != bool(telegram_chat_id):
+        missing = (
+            "대화 상대(TELEGRAM_CHAT_ID)" if telegram_token else "봇 토큰(TELEGRAM_BOT_TOKEN)"
+        )
+        raise ConfigError(f"텔레그램 {missing} 이(가) 비어 있습니다.\n" + SETUP_HINT)
+
+    webhook = env.get("DISCORD_WEBHOOK_URL", "").strip()
+    bot_token = env.get("DISCORD_BOT_TOKEN", "").strip()
+    channel_id = owner_id = 0
+    if bot_token:
+        raw_channel = env.get("DISCORD_CHANNEL_ID", "").strip()
+        raw_owner = env.get("DISCORD_OWNER_ID", "").strip()
+        if not raw_channel:
+            raise ConfigError(
+                "디스코드 봇 토큰은 있는데 보낼 채널(DISCORD_CHANNEL_ID)이 없습니다.\n"
+                + SETUP_HINT
+            )
+        if not raw_owner:
+            raise ConfigError(
+                "디스코드 봇을 조작할 사람(DISCORD_OWNER_ID)이 없습니다.\n"
+                "        이 값이 없으면 서버에 있는 누구나 감시 설정을 바꿀 수 있습니다.\n"
+                + SETUP_HINT
+            )
+        channel_id = _snowflake(raw_channel, "DISCORD_CHANNEL_ID")
+        owner_id = _snowflake(raw_owner, "DISCORD_OWNER_ID")
+
+    if not telegram_token and not bot_token and not webhook:
+        raise ConfigError("알림을 받을 곳이 하나도 없습니다.\n" + SETUP_HINT)
+
+    return telegram_token, telegram_chat_id, webhook, bot_token, channel_id, owner_id
+
+
 def load() -> Config:
     ensure_writable()
     env = _read_env(ROOT / ".env")
-    token = env.get("TELEGRAM_BOT_TOKEN")
-    chat_id = env.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        missing = "봇 토큰" if not token else "대화 상대(chat_id)"
-        raise ConfigError(
-            f"{missing} 설정이 비어 있습니다.\n"
-            "        콘솔 창에서 아래를 실행하면 차례로 안내해 드립니다.\n"
-            "            python -m meralarm --setup"
-        )
+    token, chat_id, webhook, bot_token, channel_id, owner_id = _channels(env)
 
     config_path = ROOT / "config.yaml"
     if not config_path.exists():
@@ -386,7 +440,10 @@ def load() -> Config:
         keywords=keywords,
         telegram_token=token,
         telegram_chat_id=chat_id,
-        discord_webhook=env.get("DISCORD_WEBHOOK_URL", ""),
+        discord_webhook=webhook,
+        discord_bot_token=bot_token,
+        discord_channel_id=channel_id,
+        discord_owner_id=owner_id,
         config_path=config_path,
         db_path=data_dir / "seen.db",
         log_path=ROOT / "logs" / "meralarm.log",

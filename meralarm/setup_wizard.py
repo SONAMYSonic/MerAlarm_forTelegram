@@ -17,6 +17,22 @@ import httpx
 API = "https://api.telegram.org/bot{token}/{method}"
 TOKEN_SHAPE = re.compile(r"^\d{6,}:[A-Za-z0-9_-]{30,}$")
 
+DISCORD_API = "https://discord.com/api/v10"
+# 권한 18432 = 메시지 보내기(2048) + 링크 임베드(16384). 딱 이만큼만 달라고 한다.
+DISCORD_INVITE = (
+    "https://discord.com/oauth2/authorize"
+    "?client_id={app_id}&scope=bot+applications.commands&permissions=18432"
+)
+# 글을 쓸 수 있는 채널 종류. 0 은 일반 텍스트, 5 는 공지 채널.
+TEXT_CHANNELS = (0, 5)
+
+DISCORD_KEYS = (
+    "DISCORD_WEBHOOK_URL",
+    "DISCORD_BOT_TOKEN",
+    "DISCORD_CHANNEL_ID",
+    "DISCORD_OWNER_ID",
+)
+
 LINE = "─" * 52
 
 
@@ -47,20 +63,37 @@ def read_env(path: Path) -> dict[str, str]:
 
 
 def needs_setup(path: Path) -> bool:
+    """알림 받을 곳이 하나도 없을 때만 마법사를 띄운다.
+
+    예전에는 텔레그램이 없으면 무조건 띄웠다. 디스코드만 쓰는 사람에게는 켤 때마다
+    설정을 다시 하라고 하는 꼴이 된다.
+    """
     env = read_env(path)
-    return not env.get("TELEGRAM_BOT_TOKEN") or not env.get("TELEGRAM_CHAT_ID")
+    telegram = env.get("TELEGRAM_BOT_TOKEN") and env.get("TELEGRAM_CHAT_ID")
+    discord_bot = env.get("DISCORD_BOT_TOKEN") and env.get("DISCORD_CHANNEL_ID")
+    return not (telegram or discord_bot or env.get("DISCORD_WEBHOOK_URL"))
 
 
-def write_env(path: Path, token: str, chat_id: str, discord: str = "") -> None:
+def write_env(path: Path, values: dict[str, str]) -> None:
+    def get(key: str) -> str:
+        return values.get(key, "") or ""
+
     path.write_text(
         "# MerAlarm 설정. 이 파일에는 봇 토큰이 들어 있으니 남에게 보내지 마세요.\n"
         "# 다시 설정하려면 프로그램을 --setup 옵션으로 실행하세요.\n"
         "\n"
-        f"TELEGRAM_BOT_TOKEN={token}\n"
-        f"TELEGRAM_CHAT_ID={chat_id}\n"
+        "# --- 텔레그램 ---\n"
+        f"TELEGRAM_BOT_TOKEN={get('TELEGRAM_BOT_TOKEN')}\n"
+        f"TELEGRAM_CHAT_ID={get('TELEGRAM_CHAT_ID')}\n"
         "\n"
-        "# (선택) 디스코드에도 함께 보내려면 웹후크 URL 을 넣으세요.\n"
-        f"DISCORD_WEBHOOK_URL={discord}\n",
+        "# --- 디스코드 (선택) ---\n"
+        "# 웹훅은 알림만, 봇은 알림과 명령어를 모두 합니다.\n"
+        "# 둘 다 적혀 있으면 봇만 씁니다. 안 그러면 같은 알림이 두 번 옵니다.\n"
+        f"DISCORD_WEBHOOK_URL={get('DISCORD_WEBHOOK_URL')}\n"
+        f"DISCORD_BOT_TOKEN={get('DISCORD_BOT_TOKEN')}\n"
+        f"DISCORD_CHANNEL_ID={get('DISCORD_CHANNEL_ID')}\n"
+        "# 이 사람만 명령을 쓸 수 있습니다.\n"
+        f"DISCORD_OWNER_ID={get('DISCORD_OWNER_ID')}\n",
         encoding="utf-8",
     )
     try:
@@ -81,6 +114,7 @@ async def _ask_token(client: httpx.AsyncClient, known: str = "") -> tuple[str, s
         _say("저장된 토큰이 더 이상 통하지 않습니다. 다시 발급받아 주세요.\n")
 
     _say("[1/3] 텔레그램 봇 만들기")
+    _say("      디스코드만 쓰실 거라면 빈 칸으로 건너뛰셔도 됩니다.")
     _say()
     _say("  1. 텔레그램에서 @BotFather 를 검색해 대화를 엽니다")
     _say("  2. /newbot 을 보냅니다")
@@ -91,7 +125,7 @@ async def _ask_token(client: httpx.AsyncClient, known: str = "") -> tuple[str, s
 
     for attempt in range(5):
         try:
-            token = input("  토큰을 붙여넣고 Enter (그만두려면 빈 칸): ").strip()
+            token = input("  토큰을 붙여넣고 Enter (건너뛰려면 빈 칸): ").strip()
         except (EOFError, KeyboardInterrupt):
             return None
         if not token:
@@ -167,27 +201,214 @@ async def _wait_for_chat(client: httpx.AsyncClient, token: str, username: str) -
     return None
 
 
-async def _ask_discord(client: httpx.AsyncClient, known: str = "") -> str:
-    """선택 사항. 건너뛰어도 텔레그램만으로 완전히 동작한다."""
-    if known:
-        return known
+def _bot_headers(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bot {token}"}
 
-    _say("디스코드에도 같이 받으시겠어요? (선택)")
-    _say("  받고 싶으시면 디스코드에서 웹후크 URL 을 만들어 붙여넣으세요.")
-    _say("    채널 옆 톱니 → 연동 → 웹후크 → 새 웹후크 → 웹후크 URL 복사")
-    _say("  필요 없으면 그냥 Enter 를 누르세요.")
+
+def _pick(items: list[dict], label: str) -> dict | None:
+    if len(items) == 1:
+        return items[0]
+    _say(f"\n  {label}을 고르세요.")
+    for i, item in enumerate(items, 1):
+        _say(f"    {i}. {item['name']}")
+    try:
+        answer = input(f"  번호 (1~{len(items)}): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if answer.isdigit() and 1 <= int(answer) <= len(items):
+        return items[int(answer) - 1]
+    _say("  → 번호를 못 읽었습니다.")
+    return None
+
+
+async def _check_bot_token(client: httpx.AsyncClient, token: str) -> dict | None:
+    try:
+        response = await client.get(
+            f"{DISCORD_API}/users/@me", headers=_bot_headers(token), timeout=15
+        )
+    except Exception:
+        return None
+    return response.json() if response.status_code == 200 else None
+
+
+async def _wait_for_guild(client: httpx.AsyncClient, token: str) -> dict | None:
+    """봇이 서버에 초대될 때까지 기다린다. 최대 3분."""
+    for _ in range(60):
+        try:
+            response = await client.get(
+                f"{DISCORD_API}/users/@me/guilds", headers=_bot_headers(token), timeout=15
+            )
+            guilds = response.json() if response.status_code == 200 else []
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            return None
+        except Exception:
+            guilds = []
+        if guilds:
+            return _pick(guilds, "봇이 들어간 서버")
+        await asyncio.sleep(3)
+    _say("  → 시간이 초과됐습니다. 초대 주소를 다시 열어주세요.")
+    return None
+
+
+async def _pick_channel(client: httpx.AsyncClient, token: str, guild_id: str) -> dict | None:
+    try:
+        response = await client.get(
+            f"{DISCORD_API}/guilds/{guild_id}/channels",
+            headers=_bot_headers(token),
+            timeout=15,
+        )
+        channels = response.json() if response.status_code == 200 else []
+    except Exception:
+        channels = []
+    text = sorted(
+        (c for c in channels if c.get("type") in TEXT_CHANNELS),
+        key=lambda c: c.get("position", 0),
+    )
+    if not text:
+        _say("  → 글을 쓸 수 있는 채널을 찾지 못했습니다.")
+        return None
+    return _pick(text, "알림 받을 채널")
+
+
+async def _guild_owner(
+    client: httpx.AsyncClient, token: str, guild_id: str
+) -> tuple[str, str]:
+    """(사용자 번호, 보여줄 이름). 서버를 직접 만들었다면 그게 본인이다."""
+    try:
+        response = await client.get(
+            f"{DISCORD_API}/guilds/{guild_id}", headers=_bot_headers(token), timeout=15
+        )
+        owner_id = str(response.json()["owner_id"])
+    except Exception:
+        return "", ""
+    try:
+        who = await client.get(
+            f"{DISCORD_API}/users/{owner_id}", headers=_bot_headers(token), timeout=15
+        )
+        body = who.json()
+        return owner_id, body.get("global_name") or body.get("username") or ""
+    except Exception:
+        return owner_id, ""
+
+
+def _confirm_owner(owner_id: str, owner_name: str) -> str:
+    _say("\n  명령을 쓸 수 있는 사람을 정합니다.")
+    if owner_id:
+        _say(f"    서버를 만든 {owner_name or owner_id} 님으로 하겠습니다.")
+        _say("    본인이 맞으면 그냥 Enter 를 누르세요.")
+    _say("    다른 분이라면 그 사람의 사용자 ID 를 넣으세요.")
+    _say("    (디스코드 설정 → 고급 → 개발자 모드를 켠 뒤, 이름 우클릭 → 사용자 ID 복사)")
+    try:
+        answer = input("  사용자 ID (그대로 두려면 Enter): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return owner_id
+    if not answer:
+        return owner_id
+    if not answer.isdigit():
+        _say("  → 숫자가 아닙니다. 서버를 만든 사람으로 두겠습니다.")
+        return owner_id
+    return answer
+
+
+async def _bot_test(client: httpx.AsyncClient, token: str, channel_id: str) -> bool:
+    try:
+        response = await client.post(
+            f"{DISCORD_API}/channels/{channel_id}/messages",
+            headers=_bot_headers(token),
+            json={
+                "content": (
+                    "🔔 **MerAlarm 연결됐습니다.**\n"
+                    "프로그램을 시작하면 `/help` 같은 명령을 쓸 수 있습니다."
+                )
+            },
+            timeout=20,
+        )
+    except Exception:
+        return False
+    return response.status_code in (200, 201)
+
+
+async def _ask_bot(client: httpx.AsyncClient) -> dict[str, str] | None:
+    _say()
+    _say("  봇 만들기")
+    _say("    1. https://discord.com/developers/applications 를 엽니다")
+    _say("    2. 오른쪽 위 New Application → 이름을 짓고 만듭니다")
+    _say("    3. 왼쪽 메뉴에서 Bot → Reset Token → Yes → 나온 값을 복사합니다")
+    _say("       (토큰은 그때 한 번만 보입니다. 놓치면 다시 Reset 하세요)")
+    _say()
+    _say("  ※ 봇 토큰은 비밀번호와 같습니다. 남에게 보내지 마세요.")
+    _say()
+
+    me = None
+    for _ in range(5):
+        try:
+            token = input("  봇 토큰을 붙여넣고 Enter (그만두려면 빈 칸): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if not token:
+            return None
+        # 개발자 포털에서 "Bot xxxx" 를 통째로 복사해 오는 일이 흔하다.
+        token = token.removeprefix("Bot ").strip()
+        _say("  → 확인 중...")
+        me = await _check_bot_token(client, token)
+        if me:
+            break
+        _say("  → 디스코드가 이 토큰을 거부했습니다.")
+        _say("     Application ID 나 Public Key 말고 Bot 탭의 토큰인지 확인해 주세요.")
+    if not me:
+        return None
+    _say(f"  → 확인됐습니다: {me.get('username', '')}\n")
+
+    _say("  이제 봇을 내 서버에 초대합니다.")
+    _say("  아래 주소를 브라우저 주소창에 붙여넣고, 서버를 고른 뒤 승인하세요.")
+    _say()
+    _say("    " + DISCORD_INVITE.format(app_id=me["id"]))
+    _say()
+    _say("  기다리는 중... (그만두려면 Ctrl+C)")
+
+    guild = await _wait_for_guild(client, token)
+    if not guild:
+        return None
+    _say(f"  → 들어갔습니다: {guild['name']}")
+
+    channel = await _pick_channel(client, token, guild["id"])
+    if not channel:
+        return None
+
+    owner_id = _confirm_owner(*await _guild_owner(client, token, guild["id"]))
+    if not owner_id:
+        _say("  → 사용자 ID 가 없으면 명령을 쓸 수 없습니다. 봇 설정을 중단합니다.\n")
+        return None
+
+    if await _bot_test(client, token, channel["id"]):
+        _say(f"\n  → #{channel['name']} 에 시험 삼아 보냈습니다. 디스코드를 확인해 주세요.\n")
+    else:
+        _say(f"\n  → #{channel['name']} 에 글을 쓰지 못했습니다.")
+        _say("     그 채널에서 봇에게 '메시지 보내기' 권한이 있는지 확인해 주세요.\n")
+
+    return {
+        "DISCORD_BOT_TOKEN": token,
+        "DISCORD_CHANNEL_ID": str(channel["id"]),
+        "DISCORD_OWNER_ID": owner_id,
+    }
+
+
+async def _ask_webhook(client: httpx.AsyncClient) -> str:
+    _say()
+    _say("  웹훅 만들기")
+    _say("    1. 알림 받을 채널의 톱니(채널 편집)를 누릅니다")
+    _say("    2. 연동 → 웹후크 → 새 웹후크")
+    _say("    3. '웹후크 URL 복사' 를 누릅니다")
     _say()
     try:
-        url = input("  웹후크 URL (건너뛰려면 Enter): ").strip()
+        url = input("  웹후크 URL (그만두려면 빈 칸): ").strip()
     except (EOFError, KeyboardInterrupt):
         return ""
     if not url:
-        _say()
         return ""
     if "discord.com/api/webhooks/" not in url:
         _say("  → 웹후크 주소가 아닌 것 같습니다. 건너뜁니다.\n")
         return ""
-
     try:
         response = await client.post(
             url, json={"content": "🔔 MerAlarm 연결됐습니다."}, timeout=20
@@ -199,6 +420,46 @@ async def _ask_discord(client: httpx.AsyncClient, known: str = "") -> str:
     except Exception:
         _say("  → 연결하지 못했습니다. 건너뜁니다.\n")
     return ""
+
+
+async def _setup_discord(client: httpx.AsyncClient, existing: dict[str, str]) -> dict[str, str]:
+    """선택 사항. 건너뛰어도 텔레그램만으로 완전히 동작한다."""
+    kept = {key: existing.get(key, "") for key in DISCORD_KEYS}
+    empty = {key: "" for key in DISCORD_KEYS}
+    current = "봇" if kept["DISCORD_BOT_TOKEN"] else ("웹훅" if kept["DISCORD_WEBHOOK_URL"] else "")
+
+    _say("[2/3] 디스코드 (선택)")
+    _say()
+    if current:
+        _say(f"  지금은 {current} 으로 설정돼 있습니다. 그대로 두려면 Enter 를 누르세요.")
+        _say()
+    _say("  1. 안 받음")
+    _say("  2. 웹훅 — URL 하나만 붙여넣으면 알림이 옵니다 (1분, 쉬움)")
+    _say("  3. 봇   — 알림에 더해 디스코드에서도 /add 같은 명령을 씁니다 (3~5분)")
+    _say()
+    try:
+        answer = input("  번호 (그대로 두려면 Enter): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return kept
+
+    if not answer:
+        _say()
+        return kept
+    if answer == "1":
+        _say()
+        return empty
+    if answer == "2":
+        return {**empty, "DISCORD_WEBHOOK_URL": await _ask_webhook(client)}
+    if answer == "3":
+        got = await _ask_bot(client)
+        if got:
+            # 봇이 있으면 웹훅은 쓰이지 않는다. 남겨두면 나중에 왜 안 쓰이는지 헷갈린다.
+            return {**empty, **got}
+        _say("  → 봇 설정을 마치지 못했습니다. 디스코드는 건너뜁니다.\n")
+        return empty
+
+    _say("  → 번호를 못 읽었습니다. 디스코드는 그대로 두겠습니다.\n")
+    return kept
 
 
 async def _send_test(client: httpx.AsyncClient, token: str, chat_id: str) -> bool:
@@ -273,27 +534,43 @@ async def run(env_path: Path, config_path: Path) -> bool:
     _say("  MerAlarm 첫 설정")
     _say(LINE)
     _say()
-    _say("알림을 받을 텔레그램 봇이 필요합니다. 3분이면 끝납니다.")
+    _say("알림 받을 곳이 하나는 있어야 합니다. 텔레그램이나 디스코드 중 하나면 됩니다.")
+    _say("텔레그램이 가장 간단하고, 3분이면 끝납니다.")
     _say()
 
     existing = read_env(env_path)
     async with httpx.AsyncClient() as client:
+        token = chat_id = ""
         result = await _ask_token(client, existing.get("TELEGRAM_BOT_TOKEN", ""))
         if result is None:
-            _say("설정을 중단했습니다.")
-            return False
-        token, username = result
-
-        chat_id = existing.get("TELEGRAM_CHAT_ID", "")
-        if not chat_id:
-            chat_id = await _wait_for_chat(client, token, username)
+            _say("  → 텔레그램은 건너뜁니다.\n")
+        else:
+            token, username = result
+            chat_id = existing.get("TELEGRAM_CHAT_ID", "")
             if not chat_id:
-                _say("설정을 중단했습니다.")
-                return False
+                chat_id = await _wait_for_chat(client, token, username) or ""
+            if not chat_id:
+                # 토큰만 있고 상대가 없으면 아무 데도 못 보낸다. 반쪽으로 두면
+                # 나중에 실행할 때 설정 오류로 막힌다.
+                _say("  → 대화 상대를 찾지 못해 텔레그램은 건너뜁니다.\n")
+                token = ""
 
-        discord = await _ask_discord(client, existing.get("DISCORD_WEBHOOK_URL", ""))
-        write_env(env_path, token, chat_id, discord)
-        await _send_test(client, token, chat_id)
+        discord = await _setup_discord(client, existing)
+
+        if not (token and chat_id) and not any(discord.values()):
+            _say(LINE)
+            _say("  알림 받을 곳이 하나도 없어 설정을 중단했습니다.")
+            _say("  텔레그램이나 디스코드 중 하나는 설정해 주세요.")
+            _say(LINE)
+            _say()
+            return False
+
+        write_env(
+            env_path,
+            {"TELEGRAM_BOT_TOKEN": token, "TELEGRAM_CHAT_ID": chat_id, **discord},
+        )
+        if token and chat_id:
+            await _send_test(client, token, chat_id)
 
     _ask_keyword(config_path)
 
