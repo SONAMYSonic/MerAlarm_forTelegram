@@ -45,7 +45,10 @@ New-Item -ItemType Directory $out -Force | Out-Null
 Move-Item "dist\MerAlarm.exe" "$out\MerAlarm.exe" -Force
 
 # 사용자가 직접 고칠 수 있어야 하므로 exe 안에 넣지 않고 옆에 둔다.
-Copy-Item "config.example.yaml" "$out\config.yaml"
+#
+# config.yaml 은 **일부러 넣지 않는다.** 넣어두면 새 버전을 받아 같은 폴더에
+# 덮어쓸 때 그동안 쌓아온 키워드가 통째로 날아간다. 받는 사람은 exe 만 바꾸려던
+# 것이라 그런 일이 벌어지는 줄 모른다. 처음 켤 때 프로그램이 예시본에서 만든다.
 Copy-Item "config.example.yaml" "$out\config.example.yaml"
 
 # --setup 은 명령줄 옵션이라 더블클릭으로는 실행할 수 없다. 설정을 다시 하거나
@@ -221,14 +224,22 @@ logs\meralarm.log 를 열어보세요. 무엇을 언제 확인했는지 다 남�
 들어있는 파일
 -------------
 MerAlarm.exe        본체. 이것을 두 번 누르면 시작합니다
-설정 다시하기.bat    텔레그램 봇을 다시 잡거나 디스코드를 연결할 때
-config.yaml         설정 (텔레그램에서 바꾸는 게 더 편합니다)
-config.example.yaml 설정을 처음 상태로 되돌리고 싶을 때 참고용
+설정 다시하기.bat    봇을 다시 잡거나 디스코드를 연결할 때
+config.example.yaml 설정 견본. 처음 켤 때 이것을 복사해 config.yaml 을 만듭니다
 
 실행하면 아래가 만들어집니다
-  .env      봇 토큰. 남에게 보내지 마세요
-  data\     본 상품과 가격 기록
-  logs\     실행 기록
+  config.yaml  설정 (명령어로 바꾸는 게 더 편합니다)
+  .env         봇 토큰. 남에게 보내지 마세요
+  data\        본 상품과 가격 기록
+  logs\        실행 기록
+
+새 버전으로 올릴 때
+-------------------
+MerAlarm.exe 만 새것으로 바꾸면 됩니다.
+config.yaml, .env, data 폴더는 그대로 두세요. 키워드와 설정이 유지됩니다.
+
+  (새 zip 에는 config.yaml 이 들어 있지 않습니다.
+   덮어쓰다가 키워드가 날아가는 일이 없도록 일부러 뺐습니다)
 "@ | Out-File "$out\사용법.txt" -Encoding UTF8
 
 Write-Output "== 압축 =="

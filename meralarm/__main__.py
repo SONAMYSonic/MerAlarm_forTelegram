@@ -12,7 +12,7 @@ import sys
 from logging.handlers import RotatingFileHandler
 
 from .commands import CommandCore, TelegramCommands
-from .config import Config, ConfigError, ensure_writable, load
+from .config import Config, ConfigError, ensure_config, ensure_writable, load
 from .single_instance import AlreadyRunning, SingleInstance
 from .control import Controls
 from .notifiers.discord_bot import DiscordBot
@@ -158,6 +158,9 @@ def main() -> None:
 
     try:
         ensure_writable()
+        # 배포판에는 config.yaml 이 없다. 설정 마법사가 키워드를 적어 넣으려면
+        # 그 전에 파일이 있어야 하므로 여기서 미리 만들어 둔다.
+        ensure_config(ROOT / "config.yaml", ROOT / "config.example.yaml")
     except ConfigError as e:
         sys.exit(f"[설정 오류] {e}")
 

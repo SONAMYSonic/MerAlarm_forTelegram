@@ -152,6 +152,23 @@ def ensure_writable(root: Path = ROOT) -> None:
         ) from None
 
 
+def ensure_config(config_path: Path, example_path: Path) -> None:
+    """설정 파일이 없으면 예시본에서 만든다.
+
+    배포판 zip 에는 `config.yaml` 을 담지 않는다. 담아 두면 새 버전을 받아 같은
+    폴더에 덮어쓸 때 **그동안 쌓아온 키워드가 통째로 날아간다.** 받는 사람은
+    exe 만 바꾸려던 것이라 그런 일이 벌어지는 줄 모른다.
+    """
+    if config_path.exists():
+        return
+    if not example_path.exists():
+        raise ConfigError(
+            f"설정 파일이 없습니다: {config_path}\n"
+            "        내려받은 폴더에서 config.example.yaml 을 지우지 않았는지 확인하세요."
+        )
+    shutil.copy(example_path, config_path)
+
+
 def _read_env(path: Path) -> dict[str, str]:
     if not path.exists():
         raise ConfigError("알림을 받을 곳이 설정되지 않았습니다.\n" + SETUP_HINT)
@@ -330,17 +347,7 @@ def load() -> Config:
     token, chat_id, webhook, bot_token, channel_id, owner_id = _channels(env)
 
     config_path = ROOT / "config.yaml"
-    if not config_path.exists():
-        # 배포판에서 실수로 지웠거나 처음 받은 상태일 수 있다. 예시본이 옆에 있으면
-        # 그것으로 시작한다. 없으면 무엇이 없는지 분명히 알려준다.
-        example = ROOT / "config.example.yaml"
-        if example.exists():
-            shutil.copy(example, config_path)
-        else:
-            raise ConfigError(
-                f"설정 파일이 없습니다: {config_path}\n"
-                "        내려받은 폴더에서 config.yaml 을 지우지 않았는지 확인하세요."
-            )
+    ensure_config(config_path, ROOT / "config.example.yaml")
     try:
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     except yaml.YAMLError as e:
