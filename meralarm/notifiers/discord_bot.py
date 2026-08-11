@@ -31,6 +31,24 @@ READY_TIMEOUT = 15
 log = logging.getLogger(__name__)
 
 
+class _NoVoiceNoise(logging.Filter):
+    """음성 기능 관련 경고만 걸러낸다.
+
+    `discord.Client` 를 만들 때마다 "PyNaCl is not installed" 와 "davey is not
+    installed" 를 WARNING 으로 남긴다. 우리는 글만 보내므로 상관없는 이야기인데,
+    로그를 열어본 사람은 무언가 잘못된 줄 안다.
+
+    로거 수위를 통째로 올리면 접속·재접속 같은 쓸모 있는 기록까지 사라지므로
+    이 두 줄만 집어서 뺀다.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "voice will NOT be supported" not in record.getMessage()
+
+
+logging.getLogger("discord.client").addFilter(_NoVoiceNoise())
+
+
 def _set_choices() -> list[app_commands.Choice[str]]:
     """`/set` 의 항목 목록을 설정표에서 그대로 만든다.
 
