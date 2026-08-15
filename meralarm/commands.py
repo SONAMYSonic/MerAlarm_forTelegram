@@ -19,6 +19,7 @@ config.yaml 을 고치고 재시작해야 한다. 그 대신 알림을 받는 �
 import asyncio
 import logging
 import re
+import time
 from html import escape
 
 import httpx
@@ -30,11 +31,16 @@ from .alerts import raw
 from .notifiers.queue import SendQueue
 from .notifiers.telegram import API
 from .scheduler import Scheduler
+from .store import SeenStore
 
 log = logging.getLogger(__name__)
 
 POLL_TIMEOUT = 30
 DURATION = re.compile(r"^(\d+)\s*([smh]?)$", re.IGNORECASE)
+
+# 전역 제외어를 넣겠다고 물어본 뒤 이만큼 지나면 잊는다. 한참 전에 하다 만 것이
+# 뒤늦게 확정되면 무엇을 승인했는지 모르게 된다.
+PENDING_TTL_SEC = 300
 
 HELP = """<b>MerAlarm 명령어</b>
 
@@ -42,6 +48,7 @@ HELP = """<b>MerAlarm 명령어</b>
 /list — 감시 중인 키워드
 /add <i>키워드</i> — 키워드 추가
 /del <i>번호</i> — 키워드 삭제
+/exclude — 전역 제외어 (모든 키워드에 적용)
 /config — 현재 설정 전부 보기
 /set <i>항목 값</i> — 설정 바꾸기
 /pause <i>[30m]</i> — 잠시 멈춤 (시간 생략 시 무기한)
@@ -57,6 +64,15 @@ HELP = """<b>MerAlarm 명령어</b>
 
 제외어에는 <b>모두 -를 붙여야</b> 합니다. 하나라도 빠지면 키워드의 일부인지
 제외어인지 알 수 없어 추가하지 않고 알려드립니다.
+
+<b>모든 키워드에서 빼기</b>
+키워드마다 같은 말을 반복해 적지 않아도 됩니다.
+
+<code>/exclude</code> — 지금 목록
+<code>/exclude add まとめ ジャンク</code> — 넣기
+<code>/exclude del まとめ</code> — 빼기
+
+넣기 전에 지금 추적 중인 상품 몇 건이 걸리는지 먼저 보여드립니다.
 
 <b>설정 바꾸기</b>
 
@@ -215,11 +231,22 @@ class CommandCore:
     마크다운으로 바꾼다. 채널마다 문구를 따로 두면 한쪽만 고치는 일이 생긴다.
     """
 
-    def __init__(self, cfg: Config, controls: Controls, scheduler: Scheduler) -> None:
+    def __init__(
+        self,
+        cfg: Config,
+        controls: Controls,
+        scheduler: Scheduler,
+        seen: SeenStore | None = None,
+    ) -> None:
         self._cfg = cfg
         self._controls = controls
         self._scheduler = scheduler
         self._store = KeywordStore(cfg.config_path)
+        # 전역 제외어를 넣기 전에 무엇이 걸리는지 세어 보려고 쓴다. 없어도
+        # 동작은 하되 미리보기만 생략된다.
+        self._seen = seen
+        # (넣으려던 말들, 물어본 시각). 확인을 기다리는 동안만 들고 있는다.
+        self._pending: tuple[tuple[str, ...], float] | None = None
 
     def dispatch(self, text: str) -> str:
         """명령 한 줄을 받아 답장을 돌려준다.
@@ -248,6 +275,7 @@ class CommandCore:
             "/del": self._delete,
             "/set": self._set,
             "/config": self._config,
+            "/exclude": self._exclude,
             "/pause": self._pause,
             "/resume": self._resume,
         }
@@ -278,6 +306,7 @@ class CommandCore:
     def _list(self, _: str) -> str:
         try:
             entries = self._store.entries()
+            shared = self._store.global_excludes()
         except KeywordStoreError as e:
             return f"⚠️ {escape(str(e))}"
 
@@ -286,7 +315,14 @@ class CommandCore:
             lines.append(f"{i}. <b>{escape(name)}</b>")
             if excludes:
                 lines.append("    제외: " + ", ".join(f"<code>{escape(w)}</code>" for w in excludes))
-        return "<b>감시 중인 키워드</b>\n\n" + "\n".join(lines) + "\n\n/del 번호 로 지울 수 있습니다."
+        text = "<b>감시 중인 키워드</b>\n\n" + "\n".join(lines)
+
+        # 전역 제외어는 여기 안 보이면 "왜 이 상품이 안 오지" 의 답을 찾을 수 없다.
+        if shared:
+            text += "\n\n<b>전역 제외어</b> (모든 키워드에 적용)\n" + " ".join(
+                f"<code>{escape(w)}</code>" for w in shared
+            )
+        return text + "\n\n/del 번호 로 지울 수 있습니다."
 
     def _add(self, argument: str) -> str:
         if not argument:
@@ -325,6 +361,166 @@ class CommandCore:
             return f"⚠️ {escape(str(e))}"
         self._reload()
         return f"🗑 <b>{escape(removed)}</b> 감시를 중단했습니다."
+
+    # ---- 전역 제외어 ----
+
+    def _exclude(self, argument: str) -> str:
+        parts = argument.split()
+        if not parts:
+            return self._exclude_show()
+
+        action, words = parts[0].lower(), parts[1:]
+        if action in {"add", "추가"}:
+            return self._exclude_add(words)
+        if action in {"del", "delete", "remove", "삭제", "제거"}:
+            return self._exclude_remove(words)
+        if action in {"yes", "y", "확인"}:
+            return self._exclude_confirm()
+        return f"모르는 사용법입니다: <code>{escape(action)}</code>\n\n" + self._exclude_usage()
+
+    @staticmethod
+    def _exclude_usage() -> str:
+        return (
+            "<b>전역 제외어</b>\n"
+            "제목에 이 말이 들어 있으면 <b>어느 키워드로 잡혔든</b> 알리지 않습니다.\n\n"
+            "<code>/exclude</code> — 지금 목록 보기\n"
+            "<code>/exclude add まとめ ジャンク</code> — 넣기 (여러 개 한 번에)\n"
+            "<code>/exclude del まとめ</code> — 빼기\n\n"
+            "키워드 하나에만 적용하려면 <code>/add 키워드 -제외어</code> 를 쓰세요."
+        )
+
+    def _exclude_show(self) -> str:
+        try:
+            words = self._store.global_excludes()
+        except KeywordStoreError as e:
+            return f"⚠️ {escape(str(e))}"
+        if not words:
+            return "전역 제외어가 없습니다.\n\n" + self._exclude_usage()
+        listed = " ".join(f"<code>{escape(w)}</code>" for w in words)
+        return (
+            f"<b>전역 제외어</b> {len(words)}개\n{listed}\n\n"
+            "모든 키워드에 함께 적용됩니다.\n"
+            "빼려면 <code>/exclude del 단어</code>"
+        )
+
+    @staticmethod
+    def _clean_words(words: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for word in words:
+            # /add 가 -단어 문법이라 습관적으로 붙여 쓰기 쉽다. 받아준다.
+            if word.startswith("-"):
+                word = word[1:]
+            word = word.strip()
+            if not word:
+                raise ParseError("빈 제외어가 있습니다.")
+            if len(word) > 50:
+                raise ParseError("제외어가 너무 깁니다. 50자 이내로 써주세요.")
+            if word not in cleaned:
+                cleaned.append(word)
+        if len(cleaned) > 20:
+            raise ParseError("한 번에 20개까지만 넣을 수 있습니다.")
+        return cleaned
+
+    def _exclude_add(self, words: list[str]) -> str:
+        if not words:
+            return self._exclude_usage()
+        try:
+            cleaned = self._clean_words(words)
+            having = {w.lower() for w in self._store.global_excludes()}
+        except ParseError as e:
+            return f"⚠️ {e}"
+        except KeywordStoreError as e:
+            return f"⚠️ {escape(str(e))}"
+
+        fresh = [w for w in cleaned if w.lower() not in having]
+        if not fresh:
+            return "이미 전부 들어 있습니다. <code>/exclude</code> 로 확인하세요."
+
+        warning = self._preview(fresh)
+        if warning is None:
+            return self._apply_excludes(fresh)
+        self._pending = (tuple(fresh), time.monotonic())
+        return warning
+
+    def _preview(self, words: list[str]) -> str | None:
+        """넣으면 무엇이 사라지는지 미리 보여준다. 걸리는 게 없으면 None.
+
+        전역 제외어는 한 단어만 잘못 넣어도 **모든 키워드의 알림이 조용히 죽는다.**
+        예전에 빈 항목이 문자열 "None" 으로 읽혀 상품을 삼킨 적도 있다. 사라질
+        것을 먼저 보여주고 확인을 받는다.
+        """
+        if self._seen is None:
+            return None
+
+        lines: list[str] = []
+        hits_total = tracked = 0
+        for word in words:
+            hits, tracked, samples = self._seen.matching_names(word)
+            hits_total += hits
+            if not hits:
+                lines.append(f"· <code>{escape(word)}</code> — 지금 걸리는 상품 없음")
+                continue
+            lines.append(f"· <code>{escape(word)}</code> — <b>{hits}건</b>")
+            for name in samples:
+                lines.append(f"    {escape(name[:44])}")
+
+        if not hits_total:
+            return None
+        return (
+            f"⚠️ 넣기 전에 확인해 주세요. 추적 중인 {tracked:,}건 기준입니다.\n\n"
+            + "\n".join(lines)
+            + "\n\n<b>이 상품들은 앞으로 알림이 오지 않습니다.</b>\n"
+            "넣으시려면 <code>/exclude yes</code>"
+        )
+
+    def _exclude_confirm(self) -> str:
+        if self._pending is None:
+            return "확인할 것이 없습니다. <code>/exclude add 단어</code> 부터 해주세요."
+        words, asked_at = self._pending
+        self._pending = None
+        if time.monotonic() - asked_at > PENDING_TTL_SEC:
+            return "시간이 지나 취소했습니다. <code>/exclude add 단어</code> 를 다시 해주세요."
+        return self._apply_excludes(list(words))
+
+    def _apply_excludes(self, words: list[str]) -> str:
+        try:
+            added = self._store.add_global_excludes(words, validate=self._validator())
+        except KeywordStoreError as e:
+            return f"⚠️ {escape(str(e))}"
+        if not added:
+            return "이미 전부 들어 있습니다."
+        self._reload()
+        listed = " ".join(f"<code>{escape(w)}</code>" for w in added)
+        return (
+            f"✅ 전역 제외어에 넣었습니다: {listed}\n"
+            "모든 키워드에 바로 적용됩니다. 빼려면 <code>/exclude del 단어</code>"
+        )
+
+    def _exclude_remove(self, words: list[str]) -> str:
+        if not words:
+            return "뺄 말을 적어주세요. 예: <code>/exclude del まとめ</code>"
+        removed: list[str] = []
+        missing: list[str] = []
+        for word in words:
+            try:
+                removed.append(
+                    self._store.remove_global_exclude(word, validate=self._validator())
+                )
+            except KeywordStoreError:
+                missing.append(word)
+        if removed:
+            self._reload()
+
+        lines = []
+        if removed:
+            lines.append("🗑 뺐습니다: " + " ".join(f"<code>{escape(w)}</code>" for w in removed))
+            lines.append("이 말이 든 상품도 다시 알림 대상이 됩니다.")
+        if missing:
+            lines.append(
+                "전역 제외어에 없던 말: "
+                + " ".join(f"<code>{escape(w)}</code>" for w in missing)
+            )
+        return "\n".join(lines)
 
     def _set(self, argument: str) -> str:
         tokens = argument.split()
@@ -427,9 +623,12 @@ class CommandCore:
             f"· 생존 보고 {self._show(cfg.notify.heartbeat_hour)}"
             + ("시" if cfg.notify.heartbeat_hour is not None else ""),
             f"· 기록 보관 <b>{cfg.store.keep_days}일</b>",
-            "",
-            "<b>키워드</b>",
         ]
+        if cfg.exclude:
+            lines.append(
+                "· 전역 제외어 " + " ".join(f"<code>{escape(w)}</code>" for w in cfg.exclude)
+            )
+        lines += ["", "<b>키워드</b>"]
         for i, kw in enumerate(cfg.keywords, 1):
             detail = []
             if kw.price_min is not None or kw.price_max is not None:
@@ -438,8 +637,10 @@ class CommandCore:
                 detail.append(f"가격 {low}~{high}")
             if kw.interval_sec != cfg.poll.default_interval_sec:
                 detail.append(f"주기 {kw.interval_sec}초")
-            if kw.exclude:
-                detail.append("제외 " + ", ".join(kw.exclude))
+            # 전역 제외어는 위에 따로 보여줬으므로 여기서는 이 키워드에만 적은 것만.
+            own = [w for w in kw.exclude if w not in cfg.exclude]
+            if own:
+                detail.append("제외 " + ", ".join(own))
             lines.append(f"{i}. <b>{escape(kw.name)}</b>")
             if detail:
                 lines.append("    " + escape(" · ".join(detail)))

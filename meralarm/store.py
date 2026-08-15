@@ -110,6 +110,34 @@ class SeenStore:
         )
         self._db.commit()
 
+    def matching_names(self, word: str, limit: int = 3) -> tuple[int, int, list[str]]:
+        """제외어 후보가 지금 추적 중인 상품에 몇 건이나 걸리는지 미리 본다.
+
+        전역 제외어는 한 단어만 잘못 넣어도 **모든 키워드의 알림이 조용히 죽는다.**
+        무엇이 사라질지 먼저 보여주고 확인을 받기 위한 것이다. 검색을 새로 하지
+        않고 이미 기록해 둔 이름만 훑으므로 곧바로 답이 나온다.
+
+        돌려주는 값은 (걸리는 상품 수, 추적 중인 전체 수, 예시 이름).
+        """
+        # LIKE 의 특수문자를 글자 그대로 찾게 한다. % 가 든 제목이 실제로 있다.
+        escaped = word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+        hits = self._db.execute(
+            "SELECT COUNT(DISTINCT item_id) FROM items "
+            "WHERE name LIKE ? ESCAPE '\\' COLLATE NOCASE",
+            (pattern,),
+        ).fetchone()[0]
+        total = self._db.execute("SELECT COUNT(DISTINCT item_id) FROM items").fetchone()[0]
+        samples = [
+            row[0]
+            for row in self._db.execute(
+                "SELECT DISTINCT name FROM items "
+                "WHERE name LIKE ? ESCAPE '\\' COLLATE NOCASE LIMIT ?",
+                (pattern, limit),
+            )
+        ]
+        return hits, total, samples
+
     def notified_prices(self, item_ids: list[str]) -> dict[str, int]:
         """이미 알린 상품과 그때 알린 가격. 키워드를 가리지 않는다."""
         result: dict[str, int] = {}

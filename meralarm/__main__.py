@@ -100,7 +100,7 @@ async def run(cfg: Config) -> None:
     # 고리를 끊으려고 큐를 먼저 비워둔 채 만들고 채널은 나중에 단다.
     queue = SendQueue([])
     scheduler = Scheduler(cfg, MercapiSource(), store, queue, controls)
-    core = CommandCore(cfg, controls, scheduler)
+    core = CommandCore(cfg, controls, scheduler, store)
     channels, bot = build_channels(cfg, core)
     for channel in channels:
         queue.add(channel)

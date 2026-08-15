@@ -20,20 +20,19 @@ $out = "MerAlarm-deploy.tar.gz"
 if (Test-Path $out) { Remove-Item $out -Force }
 
 # 서버에서 필요한 것만 담는다.
-#
-# config.yaml 도 담는다. 새 서버를 처음 세울 때 내 키워드를 그대로 옮기는 게
-# 편해서다. 대신 **이미 돌고 있는 서버에 다시 올릴 때는 반드시 빼야 한다** —
-# 그 서버에서 /add 로 넣은 키워드가 통째로 날아간다.
-#
-#   tar -xzf MerAlarm-deploy.tar.gz --exclude=config.yaml -C ~/MerAlarm
-#
 # config.example.yaml 은 config.yaml 이 없을 때 프로그램이 복사해 쓰는 견본이다.
-$include = @(
-    "meralarm", "scripts", "config.yaml", "config.example.yaml",
-    "requirements.txt", ".env.example", "README.md"
-)
+$include = @("meralarm", "scripts", "config.example.yaml", "requirements.txt", ".env.example", "README.md")
 $missing = $include | Where-Object { -not (Test-Path $_) }
 if ($missing) { throw "다음 파일이 없습니다: $($missing -join ', ')" }
+
+# 내 키워드가 담긴 config.yaml 은 있으면 함께 담는다. 새 서버를 처음 세울 때
+# 그대로 옮기면 편해서다.
+#
+#   [!] 이미 돌고 있는 서버에 다시 올릴 때는 반드시 빼야 한다. 그 서버에서
+#       /add 로 넣은 키워드가 통째로 날아간다.
+#
+#         tar -xzf MerAlarm-deploy.tar.gz --exclude=config.yaml -C ~/MerAlarm
+if (Test-Path "config.yaml") { $include += "config.yaml" }
 
 tar --exclude="__pycache__" -czf $out $include
 if ($LASTEXITCODE -ne 0) { throw "묶는 데 실패했습니다." }

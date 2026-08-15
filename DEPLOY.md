@@ -345,16 +345,22 @@ bash scripts/install_service.sh
 > - 작업 스케줄러에 등록했다면:
 >   `Unregister-ScheduledTask -TaskName MerAlarm -Confirm:$false`
 
-이제 키워드를 바꾸려면 SSH로 들어가 `config.yaml` 을 고치고 재시작해야 한다.
+이제부터 설정은 **봇에게 명령을 보내서** 바꾼다. SSH 로 들어올 일이 거의 없다.
 
-```bash
-cd ~/MerAlarm
-nano config.yaml
-sudo systemctl restart meralarm
+```
+/add 키워드        감시 시작        /set 항목 값     설정 바꾸기
+/list             지금 목록        /exclude        모든 키워드에서 뺄 단어
+/del 번호         빼기            /pause /resume  잠시 멈춤 / 재개
 ```
 
-이게 번거로우면 **텔레그램 봇 명령어**(`/add`, `/list`, `/pause`)를 붙이는 것이
-다음 순서다. 화면 없는 서버에서는 그게 사실상 유일한 조작 수단이 된다.
+**재시작 없이 즉시 반영된다.** 이미 돌던 키워드는 실행 리듬과 백오프 상태를 그대로
+유지하므로, 하나 추가한다고 전체 감시가 초기화되지 않는다.
+
+`config.yaml` 을 직접 고치는 것도 되지만, 그때는 재시작해야 반영된다.
+
+```bash
+cd ~/MerAlarm && nano config.yaml && sudo systemctl restart meralarm
+```
 
 ---
 

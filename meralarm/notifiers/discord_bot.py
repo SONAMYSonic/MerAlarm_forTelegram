@@ -265,6 +265,31 @@ class DiscordBot:
             target = f"{number} " if number is not None else ""
             await self._run(interaction, f"/set {target}{item.value} {value}")
 
+        @tree.command(name="exclude", description="전역 제외어 — 모든 키워드에 함께 적용")
+        @app_commands.describe(
+            action="무엇을 할지 (비우면 지금 목록을 보여줍니다)",
+            words="넣거나 뺄 말. 여러 개면 띄어쓰기로",
+        )
+        @app_commands.choices(
+            action=[
+                app_commands.Choice(name="목록 보기", value="list"),
+                app_commands.Choice(name="넣기", value="add"),
+                app_commands.Choice(name="빼기", value="del"),
+                app_commands.Choice(name="넣기 확인", value="yes"),
+            ]
+        )
+        async def exclude(
+            interaction: discord.Interaction,
+            action: app_commands.Choice[str] | None = None,
+            words: str | None = None,
+        ):
+            # 목록 보기는 인자가 없어야 한다. "list" 를 그대로 넘기면 모르는 사용법이 된다.
+            verb = action.value if action else "list"
+            if verb == "list":
+                await self._run(interaction, "/exclude")
+                return
+            await self._run(interaction, f"/exclude {verb} {words or ''}".rstrip())
+
         @tree.command(name="pause", description="잠시 멈추기")
         @app_commands.describe(duration="30m, 2h 처럼. 비우면 무기한")
         async def pause(interaction: discord.Interaction, duration: str | None = None):

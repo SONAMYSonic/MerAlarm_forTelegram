@@ -103,6 +103,9 @@ class Config:
     notify: NotifyConfig
     store: StoreConfig
     keywords: tuple[KeywordConfig, ...]
+    # 모든 키워드에 함께 적용되는 제외어. 각 키워드의 exclude 에 이미 합쳐져
+    # 있으므로 필터는 이것을 따로 보지 않는다. 여기 남기는 것은 보여주기 위해서다.
+    exclude: tuple[str, ...]
     # 채널은 하나만 있어도 된다. 비어 있는 쪽은 그냥 쓰지 않는다.
     telegram_token: str
     telegram_chat_id: str
@@ -222,12 +225,38 @@ def _optional_age(value: Any, where: str, minimum: int = 1) -> int | None:
     return value
 
 
+def _words(raw: Any, where: str) -> tuple[str, ...]:
+    """제외어 목록을 다듬는다.
+
+    값 없는 빈 항목("- " 만 쓴 줄)은 YAML 이 None 으로 읽는다. 걸러내지 않으면
+    문자열 "None" 이 제외어로 들어가 제목에 none 이 든 상품이 조용히 사라진다.
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ConfigError(f"{where} 는 목록이어야 합니다. 받은 값: {raw!r}")
+    return tuple(str(w).strip() for w in raw if w is not None and str(w).strip())
+
+
+def _merge_excludes(shared: tuple[str, ...], own: tuple[str, ...]) -> tuple[str, ...]:
+    """전역 제외어를 키워드 제외어에 **더한다.**
+
+    덮어쓰지 않는 것이 중요하다. 전역으로 빼둔 말이 키워드에 제외어를 적었다는
+    이유로 되살아나면, 왜 그 상품이 다시 오는지 알 길이 없다.
+    """
+    merged: dict[str, str] = {}
+    for word in (*shared, *own):
+        merged.setdefault(word.lower(), word)  # 필터가 소문자로 비교하므로 기준을 맞춘다
+    return tuple(merged.values())
+
+
 def _parse_keyword(
     raw: Any,
     index: int,
     default_interval: int,
     default_max_age: int | None,
     default_max_bump: int | None,
+    shared_exclude: tuple[str, ...] = (),
 ) -> KeywordConfig:
     where = f"keywords[{index}]"
 
@@ -241,7 +270,7 @@ def _parse_keyword(
             interval_sec=default_interval,
             price_min=None,
             price_max=None,
-            exclude=(),
+            exclude=shared_exclude,
             conditions=(),
             shipping_payers=(),
             max_age_days=default_max_age,
@@ -263,10 +292,6 @@ def _parse_keyword(
     if price_min is not None and price_max is not None and price_min > price_max:
         raise ConfigError(f"{where} 의 price_min 이 price_max 보다 큽니다.")
 
-    exclude = raw.get("exclude") or []
-    if not isinstance(exclude, list):
-        raise ConfigError(f"{where}.exclude 는 목록이어야 합니다.")
-
     return KeywordConfig(
         name=str(raw.get("name") or query).strip(),
         query=query,
@@ -275,11 +300,7 @@ def _parse_keyword(
         ),
         price_min=price_min,
         price_max=price_max,
-        # 빈 목록 항목("- " 만 쓴 줄)은 None 으로 읽힌다. 걸러내지 않으면 문자열
-        # "None" 이 제외어로 들어가 제목에 none 이 든 상품이 조용히 사라진다.
-        exclude=tuple(
-            str(w).strip() for w in exclude if w is not None and str(w).strip()
-        ),
+        exclude=_merge_excludes(shared_exclude, _words(raw.get("exclude"), f"{where}.exclude")),
         conditions=_int_list(raw.get("conditions"), f"{where}.conditions", range(1, 7)),
         shipping_payers=_int_list(
             raw.get("shipping_payers"), f"{where}.shipping_payers", range(1, 4)
@@ -380,11 +401,17 @@ def load() -> Config:
         notify_raw.get("max_bump_days"), "notify.max_bump_days", minimum=0
     )
 
+    # 모든 키워드에 함께 적용되는 제외어. 키워드마다 같은 말을 반복해 적지 않아도
+    # 되고, 키워드를 새로 넣을 때 빠뜨릴 일이 없다.
+    shared_exclude = _words(raw.get("exclude"), "exclude")
+
     keywords_raw = raw.get("keywords") or []
     if not isinstance(keywords_raw, list) or not keywords_raw:
         raise ConfigError("config.yaml 의 keywords 가 비어 있습니다.")
     keywords = tuple(
-        _parse_keyword(entry, i, default_interval, default_max_age, default_max_bump)
+        _parse_keyword(
+            entry, i, default_interval, default_max_age, default_max_bump, shared_exclude
+        )
         for i, entry in enumerate(keywords_raw)
     )
     names = [k.name for k in keywords]
@@ -445,6 +472,7 @@ def load() -> Config:
         ),
         store=StoreConfig(keep_days=keep_days),
         keywords=keywords,
+        exclude=shared_exclude,
         telegram_token=token,
         telegram_chat_id=chat_id,
         discord_webhook=webhook,

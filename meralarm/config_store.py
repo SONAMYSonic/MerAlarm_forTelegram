@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from ruamel.yaml import YAML
+from ruamel.yaml.comments import CommentedSeq
 
 
 # 배포판이 처음 담고 나오는 자리표시 키워드. 설정에는 키워드가 최소 하나 있어야
@@ -145,6 +146,77 @@ class KeywordStore:
             entry[key] = value
         self._save(yaml, data, validate)
         return _name_of(entry)
+
+    # ---- 전역 제외어 ----
+
+    def global_excludes(self) -> list[str]:
+        _, data = self._load()
+        return [str(w).strip() for w in (data.get("exclude") or []) if w is not None and str(w).strip()]
+
+    def _exclude_seq(self, data):
+        """전역 제외어 목록을 꺼낸다. 없으면 keywords 바로 앞에 만들어 준다.
+
+        맨 뒤에 붙이면 긴 keywords 목록 아래에 파묻혀 사람이 못 찾는다.
+        """
+        current = data.get("exclude")
+        if isinstance(current, CommentedSeq):
+            return current
+        seq = CommentedSeq(current or [])
+        if "exclude" in data:
+            data["exclude"] = seq
+            return seq
+
+        keys = list(data.keys())
+        position = keys.index("keywords") if "keywords" in keys else len(keys)
+        data.insert(position, "exclude", seq)
+        data.yaml_set_comment_before_after_key(
+            "exclude",
+            before=(
+                "모든 키워드에 함께 적용되는 제외어.\n"
+                "키워드별 exclude 를 덮어쓰지 않고 거기에 더해진다.\n"
+                "제목에 이 말이 들어 있으면 어느 키워드로 잡혔든 알리지 않는다."
+            ),
+        )
+        return seq
+
+    def add_global_excludes(
+        self, words: list[str], validate: Callable[[], object] | None = None
+    ) -> list[str]:
+        """이미 있는 말은 건너뛰고, 새로 들어간 것만 돌려준다."""
+        yaml, data = self._load()
+        seq = self._exclude_seq(data)
+        having = {str(w).strip().lower() for w in seq if w is not None}
+
+        added = []
+        for word in words:
+            word = word.strip()
+            if not word or word.lower() in having:
+                continue
+            seq.append(word)
+            having.add(word.lower())
+            added.append(word)
+
+        if not added:
+            return []
+        self._save(yaml, data, validate)
+        return added
+
+    def remove_global_exclude(
+        self, word: str, validate: Callable[[], object] | None = None
+    ) -> str:
+        yaml, data = self._load()
+        seq = data.get("exclude")
+        target = word.strip().lower()
+        index = next(
+            (i for i, w in enumerate(seq or []) if w is not None and str(w).strip().lower() == target),
+            None,
+        )
+        if index is None:
+            raise KeywordStoreError(f"'{word}' 는 전역 제외어에 없습니다.")
+        removed = str(seq[index]).strip()
+        del seq[index]
+        self._save(yaml, data, validate)
+        return removed
 
     def entries(self) -> list[tuple[str, list[str]]]:
         """표시용 (이름, 제외어) 목록. 간단형 키워드에는 제외어가 없다."""
