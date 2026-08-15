@@ -13,6 +13,8 @@ from typing import Any
 
 import yaml
 
+from .text import fold
+
 
 def _root() -> Path:
     """설정과 데이터를 둘 기준 폴더.
@@ -246,7 +248,7 @@ def _merge_excludes(shared: tuple[str, ...], own: tuple[str, ...]) -> tuple[str,
     """
     merged: dict[str, str] = {}
     for word in (*shared, *own):
-        merged.setdefault(word.lower(), word)  # 필터가 소문자로 비교하므로 기준을 맞춘다
+        merged.setdefault(fold(word), word)  # 필터와 같은 기준으로 겹치는 말을 지운다
     return tuple(merged.values())
 
 

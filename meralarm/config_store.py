@@ -14,6 +14,8 @@ from typing import Any
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedSeq
 
+from .text import fold
+
 
 # 배포판이 처음 담고 나오는 자리표시 키워드. 설정에는 키워드가 최소 하나 있어야
 # 해서 비워둘 수 없다. 사용자가 자기 키워드를 넣으면 이것은 치운다.
@@ -185,15 +187,15 @@ class KeywordStore:
         """이미 있는 말은 건너뛰고, 새로 들어간 것만 돌려준다."""
         yaml, data = self._load()
         seq = self._exclude_seq(data)
-        having = {str(w).strip().lower() for w in seq if w is not None}
+        having = {fold(str(w).strip()) for w in seq if w is not None}
 
         added = []
         for word in words:
             word = word.strip()
-            if not word or word.lower() in having:
+            if not word or fold(word) in having:
                 continue
             seq.append(word)
-            having.add(word.lower())
+            having.add(fold(word))
             added.append(word)
 
         if not added:
@@ -206,9 +208,9 @@ class KeywordStore:
     ) -> str:
         yaml, data = self._load()
         seq = data.get("exclude")
-        target = word.strip().lower()
+        target = fold(word.strip())
         index = next(
-            (i for i, w in enumerate(seq or []) if w is not None and str(w).strip().lower() == target),
+            (i for i, w in enumerate(seq or []) if w is not None and fold(str(w).strip()) == target),
             None,
         )
         if index is None:

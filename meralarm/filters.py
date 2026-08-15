@@ -11,6 +11,7 @@
 
 from .config import KeywordConfig
 from .models import Item
+from .text import fold
 
 
 def matches(item: Item, kw: KeywordConfig, *, ignore_freshness: bool = False) -> bool:
@@ -38,8 +39,9 @@ def matches(item: Item, kw: KeywordConfig, *, ignore_freshness: bool = False) ->
         return False
     if kw.shipping_payers and item.shipping_payer_id not in kw.shipping_payers:
         return False
-    name = item.name.lower()
-    return not any(word.lower() in name for word in kw.exclude)
+    # 대소문자도 전각/반각도 가리지 않는다. C108 로 적으면 c108 도 Ｃ１０８ 도 걸린다.
+    name = fold(item.name)
+    return not any(fold(word) in name for word in kw.exclude)
 
 
 def apply(items: list[Item], kw: KeywordConfig, *, ignore_freshness: bool = False) -> list[Item]:

@@ -32,6 +32,7 @@ from .notifiers.queue import SendQueue
 from .notifiers.telegram import API
 from .scheduler import Scheduler
 from .store import SeenStore
+from .text import fold
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +74,8 @@ HELP = """<b>MerAlarm 명령어</b>
 <code>/exclude del まとめ</code> — 빼기
 
 넣기 전에 지금 추적 중인 상품 몇 건이 걸리는지 먼저 보여드립니다.
+제외어는 대소문자도 전각/반각도 가리지 않습니다.
+(<code>C108</code> 로 적으면 <code>c108</code> 도 <code>Ｃ１０８</code> 도 걸립니다)
 
 <b>설정 바꾸기</b>
 
@@ -426,13 +429,13 @@ class CommandCore:
             return self._exclude_usage()
         try:
             cleaned = self._clean_words(words)
-            having = {w.lower() for w in self._store.global_excludes()}
+            having = {fold(w) for w in self._store.global_excludes()}
         except ParseError as e:
             return f"⚠️ {e}"
         except KeywordStoreError as e:
             return f"⚠️ {escape(str(e))}"
 
-        fresh = [w for w in cleaned if w.lower() not in having]
+        fresh = [w for w in cleaned if fold(w) not in having]
         if not fresh:
             return "이미 전부 들어 있습니다. <code>/exclude</code> 로 확인하세요."
 

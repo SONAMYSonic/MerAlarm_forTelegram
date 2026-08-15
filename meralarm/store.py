@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .models import Item
+from .text import fold
 
 # SQLite 의 바인딩 변수 개수 제한에 걸리지 않도록 조회를 나눠 던진다.
 _CHUNK = 400
@@ -118,25 +119,23 @@ class SeenStore:
         않고 이미 기록해 둔 이름만 훑으므로 곧바로 답이 나온다.
 
         돌려주는 값은 (걸리는 상품 수, 추적 중인 전체 수, 예시 이름).
+
+        SQL 의 LIKE 대신 파이썬으로 훑는다. LIKE 는 전각/반각을 가리므로 **미리보기와
+        실제 필터의 결과가 달라진다.** "37건이 걸립니다" 라고 해놓고 다른 수가
+        걸리면 확인을 받는 의미가 없다. 상품 천여 건이라 훑어도 순식간이다.
         """
-        # LIKE 의 특수문자를 글자 그대로 찾게 한다. % 가 든 제목이 실제로 있다.
-        escaped = word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        pattern = f"%{escaped}%"
-        hits = self._db.execute(
-            "SELECT COUNT(DISTINCT item_id) FROM items "
-            "WHERE name LIKE ? ESCAPE '\\' COLLATE NOCASE",
-            (pattern,),
-        ).fetchone()[0]
-        total = self._db.execute("SELECT COUNT(DISTINCT item_id) FROM items").fetchone()[0]
-        samples = [
-            row[0]
-            for row in self._db.execute(
-                "SELECT DISTINCT name FROM items "
-                "WHERE name LIKE ? ESCAPE '\\' COLLATE NOCASE LIMIT ?",
-                (pattern, limit),
-            )
-        ]
-        return hits, total, samples
+        needle = fold(word)
+        matched: set[str] = set()
+        every: set[str] = set()
+        samples: list[str] = []
+        for item_id, name in self._db.execute("SELECT item_id, name FROM items"):
+            every.add(item_id)
+            if item_id in matched or needle not in fold(name):
+                continue
+            matched.add(item_id)
+            if len(samples) < limit:
+                samples.append(name)
+        return len(matched), len(every), samples
 
     def notified_prices(self, item_ids: list[str]) -> dict[str, int]:
         """이미 알린 상품과 그때 알린 가격. 키워드를 가리지 않는다."""
