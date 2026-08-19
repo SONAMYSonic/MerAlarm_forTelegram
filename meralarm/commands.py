@@ -20,6 +20,7 @@ import asyncio
 import logging
 import re
 import time
+from dataclasses import dataclass, field
 from html import escape
 
 import httpx
@@ -39,9 +40,34 @@ log = logging.getLogger(__name__)
 POLL_TIMEOUT = 30
 DURATION = re.compile(r"^(\d+)\s*([smh]?)$", re.IGNORECASE)
 
-# 전역 제외어를 넣겠다고 물어본 뒤 이만큼 지나면 잊는다. 한참 전에 하다 만 것이
+# 제외어·필수어를 넣겠다고 물어본 뒤 이만큼 지나면 잊는다. 한참 전에 하다 만 것이
 # 뒤늦게 확정되면 무엇을 승인했는지 모르게 된다.
 PENDING_TTL_SEC = 300
+
+
+@dataclass(frozen=True, slots=True)
+class Pending:
+    """확인을 기다리는 동안만 들고 있는 것.
+
+    전에는 튜플이었는데 항목이 둘에서 넷으로 늘어나는 동안 자리로만 구분됐다.
+    `_pending[0]` 이 종류인지 낱말인지는 읽는 사람이 기억해야 했고, 늘릴 때마다
+    꺼내 쓰는 곳을 전부 찾아 고쳐야 했다.
+
+    시각은 만들 때 저절로 찍힌다. 부르는 쪽이 `time.monotonic()` 을 기억할 일이
+    아니고, 빠뜨리면 영영 안 만료되는 확인이 남는다.
+    """
+
+    # "exclude" 또는 "require". 물어본 것과 다른 쪽으로 확인하면 받지 않는다.
+    kind: str
+    words: tuple[str, ...]
+    # None 이면 전역, 숫자면 그 번호의 키워드. 확인은 물어본 범위를 그대로 따른다.
+    index: int | None
+    asked_at: float = field(default_factory=time.monotonic)
+
+    @property
+    def expired(self) -> bool:
+        return time.monotonic() - self.asked_at > PENDING_TTL_SEC
+
 
 HELP = """<b>MerAlarm 명령어</b>
 
@@ -263,9 +289,8 @@ class CommandCore:
         # 전역 제외어를 넣기 전에 무엇이 걸리는지 세어 보려고 쓴다. 없어도
         # 동작은 하되 미리보기만 생략된다.
         self._seen = seen
-        # (종류, 넣으려던 말들, 범위, 물어본 시각). 확인을 기다리는 동안만 들고 있는다.
-        # 종류는 "exclude"/"require", 범위는 None 이면 전역·숫자면 그 번호의 키워드다.
-        self._pending: tuple[str, tuple[str, ...], int | None, float] | None = None
+        # 확인을 기다리는 동안만 들고 있는다. 확인이 끝나거나 시간이 지나면 비운다.
+        self._pending: Pending | None = None
 
     def dispatch(self, text: str) -> str:
         """명령 한 줄을 받아 답장을 돌려준다.
@@ -516,7 +541,7 @@ class CommandCore:
         warning = self._preview(fresh, index)
         if warning is None:
             return self._apply_excludes(fresh, index)
-        self._pending = ("exclude", tuple(fresh), index, time.monotonic())
+        self._pending = Pending("exclude", tuple(fresh), index)
         return warning
 
     def _preview(self, words: list[str], index: int | None = None) -> str | None:
@@ -558,15 +583,16 @@ class CommandCore:
 
     def _confirm(self, kind: str) -> str:
         """`/exclude yes` 와 `/require yes` 가 함께 쓴다."""
-        if self._pending is None or self._pending[0] != kind:
+        pending = self._pending
+        if pending is None or pending.kind != kind:
             return f"확인할 것이 없습니다. <code>/{kind} add 단어</code> 부터 해주세요."
-        _, words, index, asked_at = self._pending
+        # 한 번 쓴 확인은 되살아나지 않는다. 만료됐더라도 여기서 비운다.
         self._pending = None
-        if time.monotonic() - asked_at > PENDING_TTL_SEC:
+        if pending.expired:
             return f"시간이 지나 취소했습니다. <code>/{kind} add 단어</code> 를 다시 해주세요."
         if kind == "exclude":
-            return self._apply_excludes(list(words), index)
-        return self._apply_requires(list(words), index)
+            return self._apply_excludes(list(pending.words), pending.index)
+        return self._apply_requires(list(pending.words), pending.index)
 
     def _exclude_confirm(self) -> str:
         return self._confirm("exclude")
@@ -740,7 +766,7 @@ class CommandCore:
         warning = self._require_preview(name, having + fresh, fresh, index)
         if warning is None:
             return self._apply_requires(fresh, index)
-        self._pending = ("require", tuple(fresh), index, time.monotonic())
+        self._pending = Pending("require", tuple(fresh), index)
         return warning
 
     def _require_preview(

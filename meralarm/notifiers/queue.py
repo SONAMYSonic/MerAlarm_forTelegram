@@ -12,6 +12,7 @@ import asyncio
 import logging
 
 from ..alerts import Alert
+from .base import Notifier
 
 SEND_GAP_SEC = 1.1
 
@@ -19,7 +20,7 @@ log = logging.getLogger(__name__)
 
 
 class SendQueue:
-    def __init__(self, notifiers: list, max_pending: int = 500) -> None:
+    def __init__(self, notifiers: list[Notifier], max_pending: int = 500) -> None:
         self._notifiers = notifiers
         self._queue: asyncio.Queue[Alert] = asyncio.Queue(maxsize=max_pending)
         self.sent = 0
@@ -30,11 +31,11 @@ class SendQueue:
         return [n.name for n in self._notifiers]
 
     @property
-    def notifiers(self) -> list:
+    def notifiers(self) -> list[Notifier]:
         """종료할 때 정리하려고 꺼내 본다."""
         return list(self._notifiers)
 
-    def add(self, notifier) -> None:
+    def add(self, notifier: Notifier) -> None:
         """채널을 나중에 붙인다.
 
         디스코드 봇은 명령 코어를 들고 있어야 하는데, 그 코어는 스케줄러를,

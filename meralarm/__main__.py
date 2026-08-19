@@ -15,6 +15,7 @@ from .commands import CommandCore, TelegramCommands
 from .config import Config, ConfigError, ensure_config, ensure_writable, load
 from .single_instance import AlreadyRunning, SingleInstance
 from .control import Controls
+from .notifiers.base import Notifier
 from .notifiers.discord_bot import DiscordBot
 from .notifiers.discord_webhook import DiscordNotifier
 from .notifiers.queue import SendQueue
@@ -67,13 +68,15 @@ def setup_logging(cfg: Config) -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-def build_channels(cfg: Config, core: CommandCore) -> tuple[list, DiscordBot | None]:
+def build_channels(
+    cfg: Config, core: CommandCore
+) -> tuple[list[Notifier], DiscordBot | None]:
     """설정에 맞는 알림 채널을 만든다. (채널 목록, 디스코드 봇)
 
     **봇과 웹훅이 둘 다 적혀 있으면 봇만 쓴다.** 둘 다 보내면 같은 알림이 두 번
     온다. 그래서 조건문이 아니라 elif 로 두어 구조상 함께 켜질 수 없게 했다.
     """
-    channels: list = []
+    channels: list[Notifier] = []
     if cfg.has_telegram:
         channels.append(TelegramNotifier(cfg.telegram_token, cfg.telegram_chat_id))
 
