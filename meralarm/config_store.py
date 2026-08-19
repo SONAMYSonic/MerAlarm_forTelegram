@@ -123,6 +123,21 @@ class KeywordStore:
         node[path[-1]] = value
         self._save(yaml, data, validate)
 
+    def _entry(self, data, index: int):
+        """1부터 세는 번호로 키워드 항목을 꺼낸다. /list 에 보이는 번호와 맞춘다.
+
+        간단형(문자열 한 줄)은 조건을 담을 수 없으므로 상세형으로 바꿔준다.
+        바꾸기만 하고 저장은 부르는 쪽이 한다 — 도중에 거절하면 파일은 그대로다.
+        """
+        count = len(data["keywords"])
+        if not 1 <= index <= count:
+            raise KeywordStoreError(f"번호는 1~{count} 사이여야 합니다.")
+        entry = data["keywords"][index - 1]
+        if isinstance(entry, str):
+            entry = {"name": entry.strip(), "query": entry.strip()}
+            data["keywords"][index - 1] = entry
+        return entry
+
     def set_keyword(
         self,
         index: int,
@@ -132,16 +147,7 @@ class KeywordStore:
     ) -> str:
         """1부터 세는 번호로 키워드 항목을 고친다. 값이 None 이면 항목을 지운다."""
         yaml, data = self._load()
-        count = len(data["keywords"])
-        if not 1 <= index <= count:
-            raise KeywordStoreError(f"번호는 1~{count} 사이여야 합니다.")
-
-        entry = data["keywords"][index - 1]
-        if isinstance(entry, str):
-            # 간단형(문자열)은 조건을 담을 수 없다. 상세형으로 바꿔준다.
-            entry = {"name": entry.strip(), "query": entry.strip()}
-            data["keywords"][index - 1] = entry
-
+        entry = self._entry(data, index)
         if value is None:
             entry.pop(key, None)
         else:
@@ -219,6 +225,108 @@ class KeywordStore:
         del seq[index]
         self._save(yaml, data, validate)
         return removed
+
+    # ---- 키워드별 낱말 목록 (exclude / require) ----
+    #
+    # 둘은 뜻만 반대일 뿐 다루는 방법이 같다. 한 벌로 두어야 한쪽만 고치는 일이 없다.
+
+    LABELS = {"exclude": "제외어", "require": "필수 포함어"}
+
+    def keyword_words(self, index: int, field: str) -> tuple[str, list[str]]:
+        """(키워드 이름, 그 키워드의 낱말 목록)."""
+        _, data = self._load()
+        count = len(data["keywords"])
+        if not 1 <= index <= count:
+            raise KeywordStoreError(f"번호는 1~{count} 사이여야 합니다.")
+        entry = data["keywords"][index - 1]
+        if isinstance(entry, str):
+            return entry.strip(), []
+        words = [
+            str(w).strip()
+            for w in (entry.get(field) or [])
+            if w is not None and str(w).strip()
+        ]
+        return _name_of(entry), words
+
+    def add_keyword_words(
+        self,
+        index: int,
+        field: str,
+        words: list[str],
+        validate: Callable[[], object] | None = None,
+    ) -> tuple[str, list[str]]:
+        """(키워드 이름, 새로 들어간 말). 이미 있는 말은 건너뛴다."""
+        yaml, data = self._load()
+        entry = self._entry(data, index)
+        seq = entry.get(field)
+        if not isinstance(seq, CommentedSeq):
+            seq = CommentedSeq(
+                [w for w in (seq or []) if w is not None and str(w).strip()]
+            )
+            entry[field] = seq
+        having = {fold(str(w).strip()) for w in seq if w is not None}
+
+        added = []
+        for word in words:
+            word = word.strip()
+            if not word or fold(word) in having:
+                continue
+            seq.append(word)
+            having.add(fold(word))
+            added.append(word)
+
+        if not added:
+            return _name_of(entry), []
+        self._save(yaml, data, validate)
+        return _name_of(entry), added
+
+    def remove_keyword_word(
+        self,
+        index: int,
+        field: str,
+        word: str,
+        validate: Callable[[], object] | None = None,
+    ) -> tuple[str, str]:
+        yaml, data = self._load()
+        entry = self._entry(data, index)
+        seq = entry.get(field) or []
+        target = fold(word.strip())
+        position = next(
+            (
+                i
+                for i, w in enumerate(seq)
+                if w is not None and fold(str(w).strip()) == target
+            ),
+            None,
+        )
+        if position is None:
+            raise KeywordStoreError(
+                f"'{word}' 는 {_name_of(entry)} 의 "
+                f"{self.LABELS.get(field, field)}에 없습니다."
+            )
+        removed = str(seq[position]).strip()
+        del seq[position]
+        # 다 빼면 항목 자체를 지운다. 빈 목록을 남기면 "- " 만 있는 줄이 되어
+        # 예전에 상품을 삼켰던 그 모양으로 이어질 수 있다.
+        if not len(seq):
+            entry.pop(field, None)
+        self._save(yaml, data, validate)
+        return _name_of(entry), removed
+
+    # 예전 이름. 부르는 곳이 읽기 쉬우라고 남겨둔다.
+
+    def keyword_excludes(self, index: int) -> tuple[str, list[str]]:
+        return self.keyword_words(index, "exclude")
+
+    def add_keyword_excludes(
+        self, index: int, words: list[str], validate: Callable[[], object] | None = None
+    ) -> tuple[str, list[str]]:
+        return self.add_keyword_words(index, "exclude", words, validate)
+
+    def remove_keyword_exclude(
+        self, index: int, word: str, validate: Callable[[], object] | None = None
+    ) -> tuple[str, str]:
+        return self.remove_keyword_word(index, "exclude", word, validate)
 
     def entries(self) -> list[tuple[str, list[str]]]:
         """표시용 (이름, 제외어) 목록. 간단형 키워드에는 제외어가 없다."""

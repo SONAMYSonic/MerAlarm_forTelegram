@@ -49,7 +49,8 @@ HELP = """<b>MerAlarm 명령어</b>
 /list — 감시 중인 키워드
 /add <i>키워드</i> — 키워드 추가
 /del <i>번호</i> — 키워드 삭제
-/exclude — 전역 제외어 (모든 키워드에 적용)
+/exclude — 제외어 (이 말이 있으면 안 알림)
+/require — 필수 포함어 (이 말이 없으면 안 알림)
 /config — 현재 설정 전부 보기
 /set <i>항목 값</i> — 설정 바꾸기
 /pause <i>[30m]</i> — 잠시 멈춤 (시간 생략 시 무기한)
@@ -66,12 +67,26 @@ HELP = """<b>MerAlarm 명령어</b>
 제외어에는 <b>모두 -를 붙여야</b> 합니다. 하나라도 빠지면 키워드의 일부인지
 제외어인지 알 수 없어 추가하지 않고 알려드립니다.
 
-<b>모든 키워드에서 빼기</b>
-키워드마다 같은 말을 반복해 적지 않아도 됩니다.
+<b>제외어 고치기</b>
+넣은 뒤에도 바꿀 수 있습니다. 지웠다 다시 넣지 않아도 됩니다.
 
-<code>/exclude</code> — 지금 목록
-<code>/exclude add まとめ ジャンク</code> — 넣기
+<code>/exclude</code> — 모든 키워드에 적용되는 목록
+<code>/exclude add まとめ</code> — 모든 키워드에 넣기
 <code>/exclude del まとめ</code> — 빼기
+
+<code>/exclude 2</code> — 2번 키워드의 제외어 보기
+<code>/exclude 2 add セット</code> — 2번 키워드에만 넣기
+<code>/exclude 2 del セット</code> — 2번에서 빼기
+
+<b>엉뚱한 상품이 잔뜩 걸릴 때</b>
+검색어가 짧으면 그 말이 다른 낱말 속에 박혀서도 걸립니다.
+(<code>ストレイライト</code> → <code>エクストレイル</code> 닛산 차, <code>ストレイキッズ</code> 아이돌)
+
+이럴 때는 제외어로 하나씩 막는 것보다 <b>있어야 할 말</b>을 정하는 편이 확실합니다.
+
+<code>/require 2 add シャニマス アイドルマスター</code>
+
+이 중 하나라도 제목에 있어야 알립니다. 없으면 안 알립니다.
 
 넣기 전에 지금 추적 중인 상품 몇 건이 걸리는지 먼저 보여드립니다.
 제외어는 대소문자도 전각/반각도 가리지 않습니다.
@@ -248,8 +263,9 @@ class CommandCore:
         # 전역 제외어를 넣기 전에 무엇이 걸리는지 세어 보려고 쓴다. 없어도
         # 동작은 하되 미리보기만 생략된다.
         self._seen = seen
-        # (넣으려던 말들, 물어본 시각). 확인을 기다리는 동안만 들고 있는다.
-        self._pending: tuple[tuple[str, ...], float] | None = None
+        # (종류, 넣으려던 말들, 범위, 물어본 시각). 확인을 기다리는 동안만 들고 있는다.
+        # 종류는 "exclude"/"require", 범위는 None 이면 전역·숫자면 그 번호의 키워드다.
+        self._pending: tuple[str, tuple[str, ...], int | None, float] | None = None
 
     def dispatch(self, text: str) -> str:
         """명령 한 줄을 받아 답장을 돌려준다.
@@ -279,6 +295,7 @@ class CommandCore:
             "/set": self._set,
             "/config": self._config,
             "/exclude": self._exclude,
+            "/require": self._require,
             "/pause": self._pause,
             "/resume": self._resume,
         }
@@ -316,6 +333,14 @@ class CommandCore:
         lines = []
         for i, (name, excludes) in enumerate(entries, 1):
             lines.append(f"{i}. <b>{escape(name)}</b>")
+            try:
+                must = self._store.keyword_words(i, "require")[1]
+            except KeywordStoreError:
+                must = []
+            if must:
+                lines.append(
+                    "    필수: " + ", ".join(f"<code>{escape(w)}</code>" for w in must)
+                )
             if excludes:
                 lines.append("    제외: " + ", ".join(f"<code>{escape(w)}</code>" for w in excludes))
         text = "<b>감시 중인 키워드</b>\n\n" + "\n".join(lines)
@@ -365,46 +390,88 @@ class CommandCore:
         self._reload()
         return f"🗑 <b>{escape(removed)}</b> 감시를 중단했습니다."
 
-    # ---- 전역 제외어 ----
+    # ---- 제외어 ----
+    #
+    # 전역(모든 키워드)과 키워드별을 같은 명령으로 다룬다. 번호를 앞에 붙이면
+    # 그 키워드에만 걸린다 — `/set 2 price_max 50000` 과 같은 번호 체계다.
 
     def _exclude(self, argument: str) -> str:
         parts = argument.split()
         if not parts:
             return self._exclude_show()
 
+        index = None
+        if parts[0].isdigit():
+            index = int(parts[0])
+            parts = parts[1:]
+            if not parts:
+                return self._exclude_show(index)
+
         action, words = parts[0].lower(), parts[1:]
         if action in {"add", "추가"}:
-            return self._exclude_add(words)
+            return self._exclude_add(words, index)
         if action in {"del", "delete", "remove", "삭제", "제거"}:
-            return self._exclude_remove(words)
+            return self._exclude_remove(words, index)
         if action in {"yes", "y", "확인"}:
+            # 확인은 물어본 곳의 범위를 그대로 따른다. 번호를 다시 적어도 무시한다.
             return self._exclude_confirm()
         return f"모르는 사용법입니다: <code>{escape(action)}</code>\n\n" + self._exclude_usage()
 
     @staticmethod
     def _exclude_usage() -> str:
         return (
-            "<b>전역 제외어</b>\n"
-            "제목에 이 말이 들어 있으면 <b>어느 키워드로 잡혔든</b> 알리지 않습니다.\n\n"
-            "<code>/exclude</code> — 지금 목록 보기\n"
-            "<code>/exclude add まとめ ジャンク</code> — 넣기 (여러 개 한 번에)\n"
+            "<b>제외어</b> — 제목에 그 말이 들어 있으면 알리지 않습니다.\n\n"
+            "<b>모든 키워드에</b>\n"
+            "<code>/exclude</code> — 지금 목록\n"
+            "<code>/exclude add まとめ ジャンク</code> — 넣기\n"
             "<code>/exclude del まとめ</code> — 빼기\n\n"
-            "키워드 하나에만 적용하려면 <code>/add 키워드 -제외어</code> 를 쓰세요."
+            "<b>한 키워드에만</b> (번호는 /list 기준)\n"
+            "<code>/exclude 2</code> — 2번 키워드의 제외어\n"
+            "<code>/exclude 2 add セット</code> — 2번에만 넣기\n"
+            "<code>/exclude 2 del セット</code> — 2번에서 빼기"
         )
 
-    def _exclude_show(self) -> str:
+    def _exclude_show(self, index: int | None = None) -> str:
         try:
-            words = self._store.global_excludes()
+            if index is None:
+                words = self._store.global_excludes()
+                if not words:
+                    return "전역 제외어가 없습니다.\n\n" + self._exclude_usage()
+                listed = " ".join(f"<code>{escape(w)}</code>" for w in words)
+                return (
+                    f"<b>전역 제외어</b> {len(words)}개\n{listed}\n\n"
+                    "모든 키워드에 함께 적용됩니다.\n"
+                    "빼려면 <code>/exclude del 단어</code>"
+                )
+
+            name, words = self._store.keyword_excludes(index)
+            shared = self._store.global_excludes()
         except KeywordStoreError as e:
             return f"⚠️ {escape(str(e))}"
-        if not words:
-            return "전역 제외어가 없습니다.\n\n" + self._exclude_usage()
-        listed = " ".join(f"<code>{escape(w)}</code>" for w in words)
-        return (
-            f"<b>전역 제외어</b> {len(words)}개\n{listed}\n\n"
-            "모든 키워드에 함께 적용됩니다.\n"
-            "빼려면 <code>/exclude del 단어</code>"
+
+        lines = [f"<b>{escape(name)}</b> 의 제외어"]
+        lines.append(
+            " ".join(f"<code>{escape(w)}</code>" for w in words) if words else "<i>없음</i>"
         )
+        if shared:
+            # 여기 안 보이면 "이 키워드엔 적은 적 없는데 왜 안 오지" 를 풀 수 없다.
+            lines += [
+                "",
+                "여기에 더해 <b>전역 제외어</b>도 적용됩니다",
+                " ".join(f"<code>{escape(w)}</code>" for w in shared),
+            ]
+        try:
+            must = self._store.keyword_words(index, "require")[1]
+        except KeywordStoreError:
+            must = []
+        if must:
+            lines += [
+                "",
+                "<b>필수 포함어</b> (이 중 하나는 제목에 있어야 함)",
+                " ".join(f"<code>{escape(w)}</code>" for w in must),
+            ]
+        lines += ["", f"<code>/exclude {index} add 단어</code> 로 넣습니다."]
+        return "\n".join(lines)
 
     @staticmethod
     def _clean_words(words: list[str]) -> list[str]:
@@ -424,12 +491,19 @@ class CommandCore:
             raise ParseError("한 번에 20개까지만 넣을 수 있습니다.")
         return cleaned
 
-    def _exclude_add(self, words: list[str]) -> str:
+    def _exclude_add(self, words: list[str], index: int | None = None) -> str:
         if not words:
             return self._exclude_usage()
         try:
             cleaned = self._clean_words(words)
-            having = {fold(w) for w in self._store.global_excludes()}
+            having = {
+                fold(w)
+                for w in (
+                    self._store.global_excludes()
+                    if index is None
+                    else self._store.keyword_excludes(index)[1]
+                )
+            }
         except ParseError as e:
             return f"⚠️ {e}"
         except KeywordStoreError as e:
@@ -437,28 +511,33 @@ class CommandCore:
 
         fresh = [w for w in cleaned if fold(w) not in having]
         if not fresh:
-            return "이미 전부 들어 있습니다. <code>/exclude</code> 로 확인하세요."
+            return "이미 전부 들어 있습니다."
 
-        warning = self._preview(fresh)
+        warning = self._preview(fresh, index)
         if warning is None:
-            return self._apply_excludes(fresh)
-        self._pending = (tuple(fresh), time.monotonic())
+            return self._apply_excludes(fresh, index)
+        self._pending = ("exclude", tuple(fresh), index, time.monotonic())
         return warning
 
-    def _preview(self, words: list[str]) -> str | None:
+    def _preview(self, words: list[str], index: int | None = None) -> str | None:
         """넣으면 무엇이 사라지는지 미리 보여준다. 걸리는 게 없으면 None.
 
-        전역 제외어는 한 단어만 잘못 넣어도 **모든 키워드의 알림이 조용히 죽는다.**
-        예전에 빈 항목이 문자열 "None" 으로 읽혀 상품을 삼킨 적도 있다. 사라질
-        것을 먼저 보여주고 확인을 받는다.
+        제외어는 한 단어만 잘못 넣어도 **알림이 조용히 죽는다.** 예전에 빈 항목이
+        문자열 "None" 으로 읽혀 상품을 삼킨 적도 있다. 사라질 것을 먼저 보여준다.
         """
         if self._seen is None:
             return None
+        try:
+            keyword = "" if index is None else self._store.keyword_excludes(index)[0]
+        except KeywordStoreError as e:
+            return f"⚠️ {escape(str(e))}"
 
         lines: list[str] = []
         hits_total = tracked = 0
         for word in words:
-            hits, tracked, samples = self._seen.matching_names(word)
+            hits, tracked, samples = self._seen.matching_names(
+                word, keyword=keyword or None
+            )
             hits_total += hits
             if not hits:
                 lines.append(f"· <code>{escape(word)}</code> — 지금 걸리는 상품 없음")
@@ -469,46 +548,74 @@ class CommandCore:
 
         if not hits_total:
             return None
+        where = f"<b>{escape(keyword)}</b> 가 잡아온" if keyword else "추적 중인"
         return (
-            f"⚠️ 넣기 전에 확인해 주세요. 추적 중인 {tracked:,}건 기준입니다.\n\n"
+            f"⚠️ 넣기 전에 확인해 주세요. {where} {tracked:,}건 기준입니다.\n\n"
             + "\n".join(lines)
             + "\n\n<b>이 상품들은 앞으로 알림이 오지 않습니다.</b>\n"
             "넣으시려면 <code>/exclude yes</code>"
         )
 
-    def _exclude_confirm(self) -> str:
-        if self._pending is None:
-            return "확인할 것이 없습니다. <code>/exclude add 단어</code> 부터 해주세요."
-        words, asked_at = self._pending
+    def _confirm(self, kind: str) -> str:
+        """`/exclude yes` 와 `/require yes` 가 함께 쓴다."""
+        if self._pending is None or self._pending[0] != kind:
+            return f"확인할 것이 없습니다. <code>/{kind} add 단어</code> 부터 해주세요."
+        _, words, index, asked_at = self._pending
         self._pending = None
         if time.monotonic() - asked_at > PENDING_TTL_SEC:
-            return "시간이 지나 취소했습니다. <code>/exclude add 단어</code> 를 다시 해주세요."
-        return self._apply_excludes(list(words))
+            return f"시간이 지나 취소했습니다. <code>/{kind} add 단어</code> 를 다시 해주세요."
+        if kind == "exclude":
+            return self._apply_excludes(list(words), index)
+        return self._apply_requires(list(words), index)
 
-    def _apply_excludes(self, words: list[str]) -> str:
+    def _exclude_confirm(self) -> str:
+        return self._confirm("exclude")
+
+    def _apply_excludes(self, words: list[str], index: int | None = None) -> str:
         try:
-            added = self._store.add_global_excludes(words, validate=self._validator())
+            if index is None:
+                name = ""
+                added = self._store.add_global_excludes(words, validate=self._validator())
+            else:
+                name, added = self._store.add_keyword_excludes(
+                    index, words, validate=self._validator()
+                )
         except KeywordStoreError as e:
             return f"⚠️ {escape(str(e))}"
         if not added:
             return "이미 전부 들어 있습니다."
+
         self._reload()
         listed = " ".join(f"<code>{escape(w)}</code>" for w in added)
+        if index is None:
+            return (
+                f"✅ 전역 제외어에 넣었습니다: {listed}\n"
+                "모든 키워드에 바로 적용됩니다. 빼려면 <code>/exclude del 단어</code>"
+            )
         return (
-            f"✅ 전역 제외어에 넣었습니다: {listed}\n"
-            "모든 키워드에 바로 적용됩니다. 빼려면 <code>/exclude del 단어</code>"
+            f"✅ <b>{escape(name)}</b> 의 제외어에 넣었습니다: {listed}\n"
+            f"이 키워드에만 적용됩니다. 빼려면 <code>/exclude {index} del 단어</code>"
         )
 
-    def _exclude_remove(self, words: list[str]) -> str:
+    def _exclude_remove(self, words: list[str], index: int | None = None) -> str:
         if not words:
-            return "뺄 말을 적어주세요. 예: <code>/exclude del まとめ</code>"
+            sample = "/exclude del まとめ" if index is None else f"/exclude {index} del セット"
+            return f"뺄 말을 적어주세요. 예: <code>{escape(sample)}</code>"
+
         removed: list[str] = []
         missing: list[str] = []
+        name = ""
         for word in words:
             try:
-                removed.append(
-                    self._store.remove_global_exclude(word, validate=self._validator())
-                )
+                if index is None:
+                    removed.append(
+                        self._store.remove_global_exclude(word, validate=self._validator())
+                    )
+                else:
+                    name, taken = self._store.remove_keyword_exclude(
+                        index, word, validate=self._validator()
+                    )
+                    removed.append(taken)
             except KeywordStoreError:
                 missing.append(word)
         if removed:
@@ -516,12 +623,213 @@ class CommandCore:
 
         lines = []
         if removed:
-            lines.append("🗑 뺐습니다: " + " ".join(f"<code>{escape(w)}</code>" for w in removed))
+            where = "전역 제외어" if index is None else f"<b>{escape(name)}</b>"
+            lines.append(
+                f"🗑 {where} 에서 뺐습니다: "
+                + " ".join(f"<code>{escape(w)}</code>" for w in removed)
+            )
             lines.append("이 말이 든 상품도 다시 알림 대상이 됩니다.")
         if missing:
             lines.append(
-                "전역 제외어에 없던 말: "
-                + " ".join(f"<code>{escape(w)}</code>" for w in missing)
+                "원래 없던 말: " + " ".join(f"<code>{escape(w)}</code>" for w in missing)
+            )
+        return "\n".join(lines)
+
+    # ---- 필수 포함어 ----
+    #
+    # 제외어와 방향이 반대다. "이 말이 있으면 빼기" 가 아니라 "이 말이 없으면 빼기".
+    #
+    # 메루카리 검색은 제목만 보지 않고 설명문까지 뒤지며, 짧은 말은 다른 낱말 속에
+    # 박혀서도 걸린다. `ストレイライト` 로 찾으면 `エクストレイル`(닛산 차),
+    # `ハイウエストレイヤード`(옷), `ストレイキッズ`(아이돌)가 함께 온다. 실측으로
+    # 120건 중 제목에 그 말이 있는 것은 13건뿐이었고, 제외어를 13개나 걸어도 쓰레기
+    # 10건이 남았다. 반대로 "있어야 할 말" 하나를 두니 쓰레기가 0이 됐다.
+    #
+    # 전역으로는 두지 않는다. 모든 키워드에 같은 말을 요구할 일은 드물고, 한 번
+    # 잘못 넣으면 모든 알림이 한꺼번에 죽는다.
+
+    def _require(self, argument: str) -> str:
+        parts = argument.split()
+        if not parts:
+            return self._require_show()
+
+        if parts[0].lower() in {"yes", "y", "확인"}:
+            return self._confirm("require")
+
+        if not parts[0].isdigit():
+            return (
+                "필수 포함어는 <b>키워드마다</b> 정합니다. 번호를 앞에 적어주세요.\n\n"
+                + self._require_usage()
+            )
+        index, parts = int(parts[0]), parts[1:]
+        if not parts:
+            return self._require_show(index)
+
+        action, words = parts[0].lower(), parts[1:]
+        if action in {"add", "추가"}:
+            return self._require_add(words, index)
+        if action in {"del", "delete", "remove", "삭제", "제거"}:
+            return self._require_remove(words, index)
+        return f"모르는 사용법입니다: <code>{escape(action)}</code>\n\n" + self._require_usage()
+
+    @staticmethod
+    def _require_usage() -> str:
+        return (
+            "<b>필수 포함어</b> — 제목에 이 말이 <b>없으면</b> 알리지 않습니다.\n"
+            "여러 개면 그중 <b>하나만 맞아도</b> 통과합니다.\n\n"
+            "<code>/require</code> — 전체 목록\n"
+            "<code>/require 2</code> — 2번 키워드의 필수 포함어\n"
+            "<code>/require 2 add シャニマス アイドルマスター</code> — 넣기\n"
+            "<code>/require 2 del シャニマス</code> — 빼기\n\n"
+            "검색어가 짧아 엉뚱한 상품이 잔뜩 걸릴 때 씁니다. "
+            "제외어로 하나씩 막는 것보다 확실합니다."
+        )
+
+    def _require_show(self, index: int | None = None) -> str:
+        try:
+            if index is not None:
+                name, words = self._store.keyword_words(index, "require")
+                if not words:
+                    return (
+                        f"<b>{escape(name)}</b> 에는 필수 포함어가 없습니다.\n"
+                        f"제목을 따지지 않고 검색에 걸린 것을 모두 봅니다.\n\n"
+                        f"<code>/require {index} add 단어</code> 로 넣습니다."
+                    )
+                listed = " ".join(f"<code>{escape(w)}</code>" for w in words)
+                return (
+                    f"<b>{escape(name)}</b> 의 필수 포함어\n{listed}\n\n"
+                    f"이 중 하나라도 제목에 있어야 알립니다.\n"
+                    f"빼려면 <code>/require {index} del 단어</code>"
+                )
+
+            entries = self._store.entries()
+            rows = []
+            for i in range(1, len(entries) + 1):
+                name, words = self._store.keyword_words(i, "require")
+                shown = (
+                    " ".join(f"<code>{escape(w)}</code>" for w in words)
+                    if words
+                    else "<i>없음</i>"
+                )
+                rows.append(f"{i}. <b>{escape(name)}</b> — {shown}")
+        except KeywordStoreError as e:
+            return f"⚠️ {escape(str(e))}"
+
+        return (
+            "<b>필수 포함어</b> (제목에 없으면 알리지 않음)\n\n"
+            + "\n".join(rows)
+            + "\n\n<code>/require 번호 add 단어</code> 로 넣습니다."
+        )
+
+    def _require_add(self, words: list[str], index: int) -> str:
+        if not words:
+            return self._require_usage()
+        try:
+            cleaned = self._clean_words(words)
+            name, having = self._store.keyword_words(index, "require")
+        except ParseError as e:
+            return f"⚠️ {e}"
+        except KeywordStoreError as e:
+            return f"⚠️ {escape(str(e))}"
+
+        known = {fold(w) for w in having}
+        fresh = [w for w in cleaned if fold(w) not in known]
+        if not fresh:
+            return "이미 전부 들어 있습니다."
+
+        warning = self._require_preview(name, having + fresh, fresh, index)
+        if warning is None:
+            return self._apply_requires(fresh, index)
+        self._pending = ("require", tuple(fresh), index, time.monotonic())
+        return warning
+
+    def _require_preview(
+        self, name: str, combined: list[str], fresh: list[str], index: int
+    ) -> str | None:
+        """넣으면 무엇만 남는지 보여준다. 셀 것이 없으면 None.
+
+        제외어보다 훨씬 위험하다. 제외어는 걸리는 것만 빼지만 필수 포함어는
+        **걸리지 않는 것을 전부 뺀다.** 한 글자만 틀려도 그 키워드가 통째로 조용해진다.
+        """
+        if self._seen is None:
+            return None
+        kept, total, keep_samples, drop_samples = self._seen.require_preview(name, combined)
+        if not total:
+            return None
+
+        listed = " ".join(f"<code>{escape(w)}</code>" for w in fresh)
+        lines = [
+            f"⚠️ 넣기 전에 확인해 주세요. {listed}",
+            "",
+            f"<b>{escape(name)}</b> 가 잡아온 {total:,}건 중 "
+            f"<b>{kept}건만 남고 {total - kept}건이 사라집니다.</b>",
+        ]
+        if keep_samples:
+            lines.append("")
+            lines.append("남는 것")
+            lines += [f"    {escape(n[:44])}" for n in keep_samples]
+        if drop_samples:
+            lines.append("")
+            lines.append("사라지는 것")
+            lines += [f"    {escape(n[:44])}" for n in drop_samples]
+        if not kept:
+            lines.append("")
+            lines.append("<b>남는 것이 하나도 없습니다.</b> 말이 맞는지 다시 봐주세요.")
+        lines.append("")
+        lines.append("넣으시려면 <code>/require yes</code>")
+        return "\n".join(lines)
+
+    def _apply_requires(self, words: list[str], index: int) -> str:
+        try:
+            name, added = self._store.add_keyword_words(
+                index, "require", words, validate=self._validator()
+            )
+        except KeywordStoreError as e:
+            return f"⚠️ {escape(str(e))}"
+        if not added:
+            return "이미 전부 들어 있습니다."
+
+        self._reload()
+        listed = " ".join(f"<code>{escape(w)}</code>" for w in added)
+        return (
+            f"✅ <b>{escape(name)}</b> 의 필수 포함어에 넣었습니다: {listed}\n"
+            f"이제 제목에 이 중 하나가 있어야 알립니다. "
+            f"빼려면 <code>/require {index} del 단어</code>"
+        )
+
+    def _require_remove(self, words: list[str], index: int) -> str:
+        if not words:
+            return f"뺄 말을 적어주세요. 예: <code>/require {index} del シャニマス</code>"
+
+        removed: list[str] = []
+        missing: list[str] = []
+        name = ""
+        for word in words:
+            try:
+                name, taken = self._store.remove_keyword_word(
+                    index, "require", word, validate=self._validator()
+                )
+                removed.append(taken)
+            except KeywordStoreError:
+                missing.append(word)
+        if removed:
+            self._reload()
+
+        lines = []
+        if removed:
+            lines.append(
+                f"🗑 <b>{escape(name)}</b> 의 필수 포함어에서 뺐습니다: "
+                + " ".join(f"<code>{escape(w)}</code>" for w in removed)
+            )
+            try:
+                left = self._store.keyword_words(index, "require")[1]
+            except KeywordStoreError:
+                left = []
+            if not left:
+                lines.append("이제 제목을 따지지 않고 검색에 걸린 것을 모두 봅니다.")
+        if missing:
+            lines.append(
+                "원래 없던 말: " + " ".join(f"<code>{escape(w)}</code>" for w in missing)
             )
         return "\n".join(lines)
 
@@ -640,6 +948,8 @@ class CommandCore:
                 detail.append(f"가격 {low}~{high}")
             if kw.interval_sec != cfg.poll.default_interval_sec:
                 detail.append(f"주기 {kw.interval_sec}초")
+            if kw.require:
+                detail.append("필수 " + ", ".join(kw.require))
             # 전역 제외어는 위에 따로 보여줬으므로 여기서는 이 키워드에만 적은 것만.
             own = [w for w in kw.exclude if w not in cfg.exclude]
             if own:

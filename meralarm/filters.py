@@ -2,7 +2,7 @@
 
 조건은 두 갈래다.
 
-- **늘 적용되는 것** — 가격, 제외어, 상품 상태, 배송비 부담자.
+- **늘 적용되는 것** — 가격, 필수 포함어, 제외어, 상품 상태, 배송비 부담자.
   아예 관심 없는 물건을 걸러낸다.
 - **신규 알림에만 적용되는 것** — 출품 경과일(age), 끌어올림(bump).
   "새로 나온 물건이라고 알릴지"를 정할 뿐, 추적을 그만두라는 뜻이 아니다.
@@ -41,6 +41,13 @@ def matches(item: Item, kw: KeywordConfig, *, ignore_freshness: bool = False) ->
         return False
     # 대소문자도 전각/반각도 가리지 않는다. C108 로 적으면 c108 도 Ｃ１０８ 도 걸린다.
     name = fold(item.name)
+
+    # 필수 포함어는 **하나라도 맞으면** 통과다(OR). 여러 개를 두는 이유가
+    # "시리즈명이든 유닛명이든 멤버 이름이든 뭐 하나는 있어야 한다" 이기 때문이다.
+    # 전부 있어야 한다고 하면 제목이 짧은 진짜 물건이 몽땅 걸러진다.
+    if kw.require and not any(fold(word) in name for word in kw.require):
+        return False
+
     return not any(fold(word) in name for word in kw.exclude)
 
 

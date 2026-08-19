@@ -265,10 +265,11 @@ class DiscordBot:
             target = f"{number} " if number is not None else ""
             await self._run(interaction, f"/set {target}{item.value} {value}")
 
-        @tree.command(name="exclude", description="전역 제외어 — 모든 키워드에 함께 적용")
+        @tree.command(name="exclude", description="제외어 보기·고치기")
         @app_commands.describe(
             action="무엇을 할지 (비우면 지금 목록을 보여줍니다)",
             words="넣거나 뺄 말. 여러 개면 띄어쓰기로",
+            number="이 키워드에만 적용할 때 /list 의 번호. 비우면 모든 키워드",
         )
         @app_commands.choices(
             action=[
@@ -282,13 +283,42 @@ class DiscordBot:
             interaction: discord.Interaction,
             action: app_commands.Choice[str] | None = None,
             words: str | None = None,
+            number: int | None = None,
         ):
-            # 목록 보기는 인자가 없어야 한다. "list" 를 그대로 넘기면 모르는 사용법이 된다.
+            # 목록 보기에는 동작 이름을 붙이지 않는다. "list" 를 그대로 넘기면
+            # 모르는 사용법이 된다.
             verb = action.value if action else "list"
-            if verb == "list":
-                await self._run(interaction, "/exclude")
+            scope = f"{number} " if number is not None else ""
+            tail = "" if verb == "list" else f"{verb} {words or ''}"
+            await self._run(interaction, f"/exclude {scope}{tail}".rstrip())
+
+        @tree.command(name="require", description="필수 포함어 — 이 말이 없으면 안 알림")
+        @app_commands.describe(
+            number="키워드 번호 (/list 기준). 비우면 전체 목록",
+            action="무엇을 할지",
+            words="넣거나 뺄 말. 여러 개면 띄어쓰기로",
+        )
+        @app_commands.choices(
+            action=[
+                app_commands.Choice(name="목록 보기", value="list"),
+                app_commands.Choice(name="넣기", value="add"),
+                app_commands.Choice(name="빼기", value="del"),
+                app_commands.Choice(name="넣기 확인", value="yes"),
+            ]
+        )
+        async def require(
+            interaction: discord.Interaction,
+            number: int | None = None,
+            action: app_commands.Choice[str] | None = None,
+            words: str | None = None,
+        ):
+            verb = action.value if action else "list"
+            if verb == "yes":
+                await self._run(interaction, "/require yes")
                 return
-            await self._run(interaction, f"/exclude {verb} {words or ''}".rstrip())
+            scope = f"{number} " if number is not None else ""
+            tail = "" if verb == "list" else f"{verb} {words or ''}"
+            await self._run(interaction, f"/require {scope}{tail}".rstrip())
 
         @tree.command(name="pause", description="잠시 멈추기")
         @app_commands.describe(duration="30m, 2h 처럼. 비우면 무기한")

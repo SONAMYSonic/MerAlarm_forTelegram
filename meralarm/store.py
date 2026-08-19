@@ -111,14 +111,19 @@ class SeenStore:
         )
         self._db.commit()
 
-    def matching_names(self, word: str, limit: int = 3) -> tuple[int, int, list[str]]:
+    def matching_names(
+        self, word: str, limit: int = 3, keyword: str | None = None
+    ) -> tuple[int, int, list[str]]:
         """제외어 후보가 지금 추적 중인 상품에 몇 건이나 걸리는지 미리 본다.
 
         전역 제외어는 한 단어만 잘못 넣어도 **모든 키워드의 알림이 조용히 죽는다.**
         무엇이 사라질지 먼저 보여주고 확인을 받기 위한 것이다. 검색을 새로 하지
         않고 이미 기록해 둔 이름만 훑으므로 곧바로 답이 나온다.
 
-        돌려주는 값은 (걸리는 상품 수, 추적 중인 전체 수, 예시 이름).
+        `keyword` 를 주면 그 키워드가 잡아온 상품만 센다. 키워드 하나에만 붙일
+        제외어인데 전체 기준으로 "122건이 걸립니다" 라고 하면 겁만 준다.
+
+        돌려주는 값은 (걸리는 상품 수, 훑어본 전체 수, 예시 이름).
 
         SQL 의 LIKE 대신 파이썬으로 훑는다. LIKE 는 전각/반각을 가리므로 **미리보기와
         실제 필터의 결과가 달라진다.** "37건이 걸립니다" 라고 해놓고 다른 수가
@@ -128,7 +133,14 @@ class SeenStore:
         matched: set[str] = set()
         every: set[str] = set()
         samples: list[str] = []
-        for item_id, name in self._db.execute("SELECT item_id, name FROM items"):
+        rows = (
+            self._db.execute("SELECT item_id, name FROM items")
+            if keyword is None
+            else self._db.execute(
+                "SELECT item_id, name FROM items WHERE keyword = ?", (keyword,)
+            )
+        )
+        for item_id, name in rows:
             every.add(item_id)
             if item_id in matched or needle not in fold(name):
                 continue
@@ -136,6 +148,37 @@ class SeenStore:
             if len(samples) < limit:
                 samples.append(name)
         return len(matched), len(every), samples
+
+    def require_preview(
+        self, keyword: str, words: list[str], limit: int = 3
+    ) -> tuple[int, int, list[str], list[str]]:
+        """필수 포함어를 걸면 무엇이 남고 무엇이 사라지는지 미리 본다.
+
+        제외어와 방향이 반대다. 제외어는 걸리는 것을 빼지만 필수 포함어는
+        **걸리지 않는 것을 전부 뺀다.** 한 글자만 틀려도 그 키워드의 알림이
+        통째로 죽으므로, 남는 수와 사라지는 수를 함께 보여주고 확인을 받는다.
+
+        돌려주는 값은 (남는 수, 전체 수, 남는 예시, 사라지는 예시).
+        """
+        needles = [fold(w) for w in words]
+        kept: set[str] = set()
+        every: set[str] = set()
+        keep_samples: list[str] = []
+        drop_samples: list[str] = []
+        for item_id, name in self._db.execute(
+            "SELECT item_id, name FROM items WHERE keyword = ?", (keyword,)
+        ):
+            if item_id in every:
+                continue
+            every.add(item_id)
+            folded = fold(name)
+            if any(n in folded for n in needles):
+                kept.add(item_id)
+                if len(keep_samples) < limit:
+                    keep_samples.append(name)
+            elif len(drop_samples) < limit:
+                drop_samples.append(name)
+        return len(kept), len(every), keep_samples, drop_samples
 
     def notified_prices(self, item_ids: list[str]) -> dict[str, int]:
         """이미 알린 상품과 그때 알린 가격. 키워드를 가리지 않는다."""

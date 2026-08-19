@@ -90,6 +90,14 @@ class KeywordConfig:
     price_min: int | None
     price_max: int | None
     exclude: tuple[str, ...]
+    # 제목에 이 중 하나는 반드시 있어야 한다. 비어 있으면 따지지 않는다.
+    #
+    # 메루카리 검색은 제목만 보지 않고 설명문까지 뒤지며, 짧은 말은 다른 낱말
+    # 속에 박혀서도 걸린다. `ストレイライト` 로 찾으면 `エクストレイル`(닛산 차),
+    # `ハイウエストレイヤード`(옷), `ストレイキッズ`(아이돌)가 함께 온다.
+    # 실측으로 120건 중 제목에 `ストレイライト` 가 있는 것은 13건뿐이었다.
+    # 제외어로 하나씩 막으면 끝이 없어서, 반대로 "있어야 할 말"을 두게 했다.
+    require: tuple[str, ...]
     conditions: tuple[int, ...]
     shipping_payers: tuple[int, ...]
     # 출품한 지 이만큼 지난 상품은 알리지 않는다. None 이면 제한 없음.
@@ -273,6 +281,7 @@ def _parse_keyword(
             price_min=None,
             price_max=None,
             exclude=shared_exclude,
+            require=(),
             conditions=(),
             shipping_payers=(),
             max_age_days=default_max_age,
@@ -303,6 +312,7 @@ def _parse_keyword(
         price_min=price_min,
         price_max=price_max,
         exclude=_merge_excludes(shared_exclude, _words(raw.get("exclude"), f"{where}.exclude")),
+        require=_words(raw.get("require"), f"{where}.require"),
         conditions=_int_list(raw.get("conditions"), f"{where}.conditions", range(1, 7)),
         shipping_payers=_int_list(
             raw.get("shipping_payers"), f"{where}.shipping_payers", range(1, 4)
