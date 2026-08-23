@@ -53,11 +53,24 @@ class MercapiSource:
             )
 
     async def search(self, keyword: str) -> list[Item]:
+        """판매중인 상품만. 이미 팔린 것을 알려줘 봐야 살 수 없다."""
+        return await self._search(keyword, S.Status.STATUS_ON_SALE)
+
+    async def search_sold(self, keyword: str) -> list[Item]:
+        """판매완료된 상품. 알림 대상이 아니라 **진단용**이다.
+
+        판매중이 0건일 때 "검색어가 틀린 것"과 "지금 다 팔린 것"을 가른다.
+        둘은 사용자가 할 일이 정반대다 — 앞은 고쳐야 하고 뒤는 기다리면 된다.
+        겉으로는 똑같이 "0건"이라 이것 없이는 구분할 방법이 없다.
+        """
+        return await self._search(keyword, S.Status.STATUS_SOLD_OUT)
+
+    async def _search(self, keyword: str, status) -> list[Item]:
         results = await self._api.search(
             keyword,
             sort_by=S.SortBy.SORT_CREATED_TIME,
             sort_order=S.SortOrder.ORDER_DESC,
-            status=[S.Status.STATUS_ON_SALE],
+            status=[status],
         )
         return [
             Item(

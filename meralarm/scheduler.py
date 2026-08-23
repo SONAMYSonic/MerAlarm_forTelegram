@@ -248,6 +248,94 @@ class Scheduler:
 
     # ---- 한 키워드 처리 ----
 
+    async def _sold_count(self, kw: KeywordConfig) -> int | None:
+        """판매완료 건수. 수집기가 못 세면 None.
+
+        `ItemSource` 규약에는 넣지 않았다. 진단에만 쓰는 것이라 폴백 수집기가
+        이것 하나 때문에 못 붙으면 손해다. 있으면 쓰고 없으면 건너뛴다.
+        """
+        lookup = getattr(self._source, "search_sold", None)
+        if lookup is None:
+            return None
+        try:
+            await self._limiter.acquire()
+            return len(await lookup(kw.query))
+        except Exception:
+            log.debug("[%s] 판매완료 조회 실패", kw.name, exc_info=True)
+            return None
+
+    async def _seed_empty(self, kw: KeywordConfig, found: int) -> None:
+        """담을 것이 없어도 최초 적재를 마친 것으로 표시하고, **한 번만** 알린다.
+
+        표시해 두지 않으면 나중에 처음으로 잡힌 상품이 "최초 적재" 대상이 되어
+        기록만 되고 알림이 나가지 않는다. 즉 **0건으로 시작한 키워드는 첫 매물을
+        반드시 놓친다.** 아직 안 나온 물건을 미리 걸어두는 쓰임에서 가장 치명적인데,
+        그 쓰임이야말로 이 프로그램을 쓰는 이유다.
+
+        알리는 이유는 따로 있다. 겉으로는 "조용하다"가 세 가지를 다 뜻한다 —
+        검색어가 틀렸거나, 지금 다 팔렸거나, 조건이 너무 빡빡하거나. 손볼 곳이
+        저마다 다른데 사용자에게는 똑같이 보인다. 그래서 어느 쪽인지 말해준다.
+
+        `found` 는 검색에 걸린 건수다. 0 이면 검색 자체가 비었고, 0 보다 크면
+        걸리긴 했는데 조건이 전부 걸러냈다는 뜻이다.
+        """
+        if self._store.is_seeded(kw.name):
+            return
+        self._store.mark_seeded(kw.name)
+        name = kw.name
+
+        if found:
+            log.info("[%s] %d건이 잡혔지만 조건에 맞는 것이 없습니다", name, found)
+            self._queue.put(
+                alerts.notice(
+                    "🔎 조건에 맞는 상품이 없습니다",
+                    f"'{name}' 로 {found}건이 잡혔지만 조건에 맞는 것이 없습니다.\n"
+                    f"/exclude 로 제외어와 필수 포함어를, /config 로 가격·상태 조건을"
+                    f" 확인해 보세요.\n"
+                    f"조건에 맞는 상품이 올라오면 알려드리겠습니다.",
+                )
+            )
+            return
+
+        sold = await self._sold_count(kw)
+
+        if sold:
+            # 검색어는 맞다. 지금 다 팔렸을 뿐이니 기다리면 된다.
+            log.info("[%s] 판매중 0건 · 판매완료 %d건. 재출품을 기다립니다", name, sold)
+            self._queue.put(
+                alerts.notice(
+                    "🔎 지금은 살 수 있는 것이 없습니다",
+                    f"'{name}' 로 판매중인 상품이 없습니다.\n"
+                    f"다만 판매완료가 {sold}건 있으니 검색어는 맞습니다.\n"
+                    f"다시 올라오면 알려드리겠습니다.",
+                )
+            )
+            return
+
+        if sold is None:
+            log.warning("[%s] 지금 잡히는 상품이 없습니다", name)
+            self._queue.put(
+                alerts.notice(
+                    "🔎 지금 잡히는 상품이 없습니다",
+                    f"'{name}' 로 판매중인 상품이 없습니다.\n"
+                    f"새로 올라오면 알려드리겠습니다.",
+                )
+            )
+            return
+
+        # 판매중도 판매완료도 0. 그 말로 팔린 물건이 아예 없다는 뜻이라
+        # 검색어 쪽을 의심하는 편이 맞다.
+        log.warning("[%s] 판매중도 판매완료도 0건. 검색어를 확인하세요", name)
+        self._queue.put(
+            alerts.notice(
+                "⚠️ 검색어를 확인해 주세요",
+                f"'{name}' 은 판매중도 판매완료도 0건입니다.\n"
+                f"메루카리에서 그대로 쳐서 나오는지 확인해 보세요.\n"
+                f"낱말을 띄어 쓰면 <b>둘 다 든</b> 상품만 찾습니다 — 각각은 흔해도"
+                f" 함께 든 물건이 없으면 0건이 됩니다.",
+            )
+        )
+
     async def _poll(self, state: KeywordState) -> None:
         kw = state.cfg
         await self._limiter.acquire()
@@ -255,7 +343,7 @@ class Scheduler:
         self.stats.requests += 1
 
         if not items:
-            log.warning("[%s] 검색 결과가 비어 있습니다", kw.name)
+            await self._seed_empty(kw, 0)
             return
 
         total = len(items)
@@ -264,7 +352,7 @@ class Scheduler:
         # 아니다. 걸러질 상품도 가격을 기록해 두어야 값을 내렸을 때 알아챈다.
         items = filters.apply(items, kw, ignore_freshness=True)
         if not items:
-            log.info("[%s] %d건 중 조건에 맞는 상품 없음", kw.name, total)
+            await self._seed_empty(kw, total)
             return
 
         if not self._store.is_seeded(kw.name):
