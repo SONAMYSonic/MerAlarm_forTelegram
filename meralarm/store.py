@@ -44,6 +44,23 @@ CREATE TABLE IF NOT EXISTS notified (
     keyword     TEXT    NOT NULL,
     notified_at TEXT    NOT NULL
 );
+
+-- 사용자가 "이 상품은 더 알리지 마" 라고 한 것. 키워드를 가리지 않는다.
+-- 이름은 무시한 그 순간의 것을 남긴다. items 쪽 기록이 지워진 뒤에도
+-- 목록에서 무엇인지 알아볼 수 있어야 한다.
+CREATE TABLE IF NOT EXISTS muted (
+    item_id  TEXT PRIMARY KEY,
+    name     TEXT NOT NULL,
+    muted_at TEXT NOT NULL
+);
+
+-- 알림을 받지 않을 판매자. note 는 차단할 때 보고 있던 상품 이름이다.
+-- 판매자 번호만으로는 나중에 왜 막았는지 알 길이 없다.
+CREATE TABLE IF NOT EXISTS blocked_sellers (
+    seller_id  TEXT PRIMARY KEY,
+    note       TEXT NOT NULL,
+    blocked_at TEXT NOT NULL
+);
 """
 
 
@@ -227,6 +244,117 @@ class SeenStore:
         ).rowcount
         self._db.commit()
         return items, notified
+
+    def purge_muted(self, keep_days: int) -> int:
+        """팔렸거나 내려간 상품의 무시 기록을 지운다. 지운 건수를 돌려준다.
+
+        상품이 팔렸는지 하나하나 물어보지 않는다. 무시한 상품 수만큼 요청이 늘어
+        차단 위험만 커진다. 대신 `purge()` 가 이미 하는 판단을 그대로 빌린다 —
+        **검색에 안 보인 지 keep_days 가 지나 items 에서 지워진 상품은 팔렸거나
+        내려간 것이다.** 그 상품의 무시 기록도 이제 쓸 데가 없다.
+
+        반드시 `purge()` 뒤에 불러야 한다. 먼저 부르면 지워질 상품이 아직 items 에
+        남아 있어 한 바퀴 늦게 정리된다.
+
+        무시한 지 keep_days 가 안 된 것은 남긴다. 검색에 아직 한 번도 안 걸린
+        상품을 주소로 직접 무시해 둔 경우, 나타나기도 전에 지워지면 안 된다.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat(
+            timespec="seconds"
+        )
+        gone = self._db.execute(
+            "DELETE FROM muted WHERE muted_at < ? "
+            "AND item_id NOT IN (SELECT item_id FROM items)",
+            (cutoff,),
+        ).rowcount
+        self._db.commit()
+        return gone
+
+    # ---- 무시·차단 ----
+
+    def name_of(self, item_id: str) -> str | None:
+        """기록에 남은 상품 이름. 버튼으로 무시·차단할 때 무엇인지 알려주려고 쓴다."""
+        row = self._db.execute(
+            "SELECT name FROM items WHERE item_id = ? ORDER BY last_seen DESC LIMIT 1",
+            (item_id,),
+        ).fetchone()
+        return row[0] if row else None
+
+    def mute(self, item_id: str, name: str) -> bool:
+        """새로 무시하게 됐으면 True. 이미 무시 중이면 그대로 두고 False."""
+        cur = self._db.execute(
+            "INSERT OR IGNORE INTO muted (item_id, name, muted_at) VALUES (?, ?, ?)",
+            (item_id, name, _now()),
+        )
+        self._db.commit()
+        return cur.rowcount == 1
+
+    def unmute(self, item_id: str) -> str | None:
+        """무시를 풀었으면 그 상품 이름, 원래 무시 중이 아니었으면 None."""
+        row = self._db.execute(
+            "SELECT name FROM muted WHERE item_id = ?", (item_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        self._db.execute("DELETE FROM muted WHERE item_id = ?", (item_id,))
+        self._db.commit()
+        return row[0]
+
+    def muted(self) -> list[tuple[str, str, str]]:
+        """(상품 번호, 이름, 무시한 시각). 최근 것부터."""
+        return self._db.execute(
+            "SELECT item_id, name, muted_at FROM muted ORDER BY muted_at DESC"
+        ).fetchall()
+
+    def block(self, seller_id: str, note: str) -> bool:
+        """새로 차단하게 됐으면 True. 이미 차단 중이면 그대로 두고 False."""
+        cur = self._db.execute(
+            "INSERT OR IGNORE INTO blocked_sellers (seller_id, note, blocked_at) "
+            "VALUES (?, ?, ?)",
+            (seller_id, note, _now()),
+        )
+        self._db.commit()
+        return cur.rowcount == 1
+
+    def unblock(self, seller_id: str) -> str | None:
+        """차단을 풀었으면 메모, 원래 차단 중이 아니었으면 None."""
+        row = self._db.execute(
+            "SELECT note FROM blocked_sellers WHERE seller_id = ?", (seller_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        self._db.execute("DELETE FROM blocked_sellers WHERE seller_id = ?", (seller_id,))
+        self._db.commit()
+        return row[0]
+
+    def blocked(self) -> list[tuple[str, str, str]]:
+        """(판매자 번호, 메모, 차단한 시각). 최근 것부터."""
+        return self._db.execute(
+            "SELECT seller_id, note, blocked_at FROM blocked_sellers ORDER BY blocked_at DESC"
+        ).fetchall()
+
+    def silenced(
+        self, item_ids: list[str], seller_ids: list[str]
+    ) -> tuple[set[str], set[str]]:
+        """이 중 무시한 상품과 차단한 판매자. 매 회차 알림 후보에만 묻는다."""
+        muted: set[str] = set()
+        blocked: set[str] = set()
+        for table, column, ids, out in (
+            ("muted", "item_id", item_ids, muted),
+            ("blocked_sellers", "seller_id", seller_ids, blocked),
+        ):
+            unique = list(dict.fromkeys(ids))
+            for start in range(0, len(unique), _CHUNK):
+                chunk = unique[start : start + _CHUNK]
+                placeholders = ",".join("?" * len(chunk))
+                out.update(
+                    row[0]
+                    for row in self._db.execute(
+                        f"SELECT {column} FROM {table} WHERE {column} IN ({placeholders})",
+                        chunk,
+                    )
+                )
+        return muted, blocked
 
     def count(self, keyword: str) -> int:
         return self._db.execute(

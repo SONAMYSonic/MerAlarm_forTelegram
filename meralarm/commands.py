@@ -17,6 +17,7 @@ config.yaml 을 고치고 재시작해야 한다. 그 대신 알림을 받는 �
 """
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -32,12 +33,15 @@ from .alerts import raw
 from .notifiers.queue import SendQueue
 from .notifiers.telegram import API
 from .scheduler import Scheduler
+from .silence import SilenceCommands, action_to_command, undo_actions
 from .store import SeenStore
 from .text import fold
 
 log = logging.getLogger(__name__)
 
 POLL_TIMEOUT = 30
+# 메시지와 고친 메시지, 그리고 알림 아래 버튼 누름.
+ALLOWED_UPDATES = ["message", "edited_message", "callback_query"]
 DURATION = re.compile(r"^(\d+)\s*([smh]?)$", re.IGNORECASE)
 
 # 제외어·필수어를 넣겠다고 물어본 뒤 이만큼 지나면 잊는다. 한참 전에 하다 만 것이
@@ -81,7 +85,14 @@ HELP = """<b>MerAlarm 명령어</b>
 /set <i>항목 값</i> — 설정 바꾸기
 /pause <i>[30m]</i> — 잠시 멈춤 (시간 생략 시 무기한)
 /resume — 다시 시작
+/mute — 무시 중인 상품 (값을 내려도 안 알림)
+/block — 차단한 판매자
 /help — 이 도움말
+
+<b>이 상품·이 판매자는 그만</b>
+알림 아래의 <b>🔇 이 상품 무시</b> · <b>🚫 판매자 차단</b> 버튼을 누르면 됩니다.
+잘못 눌렀으면 답장의 <b>↩ 되돌리기</b> 를 누르세요.
+가격 기록은 계속하므로 되돌리면 그때부터 다시 알립니다.
 
 <b>제외어 붙이기</b>
 제목에 그 말이 들어가면 알리지 않습니다.
@@ -291,6 +302,8 @@ class CommandCore:
         self._seen = seen
         # 확인을 기다리는 동안만 들고 있는다. 확인이 끝나거나 시간이 지나면 비운다.
         self._pending: Pending | None = None
+        # 상품 무시·판매자 차단. 기록 저장소에 담으므로 seen 을 함께 쓴다.
+        self._silence = SilenceCommands(seen)
 
     def dispatch(self, text: str) -> str:
         """명령 한 줄을 받아 답장을 돌려준다.
@@ -323,6 +336,8 @@ class CommandCore:
             "/require": self._require,
             "/pause": self._pause,
             "/resume": self._resume,
+            "/mute": self._silence.mute,
+            "/block": self._silence.block,
         }
         handler = handlers.get(command)
         if handler is None:
@@ -375,6 +390,10 @@ class CommandCore:
             text += "\n\n<b>전역 제외어</b> (모든 키워드에 적용)\n" + " ".join(
                 f"<code>{escape(w)}</code>" for w in shared
             )
+        # 제외어와 같은 이유다. 여기 안 보이면 "왜 이 상품이 안 오지" 를 풀 수 없다.
+        silenced = self._silence.summary()
+        if silenced:
+            text += "\n\n" + silenced
         return text + "\n\n/del 번호 로 지울 수 있습니다."
 
     def _add(self, argument: str) -> str:
@@ -1053,7 +1072,10 @@ class TelegramCommands:
                 await asyncio.sleep(10)
                 continue
             for update in updates:
-                self._on_update(update)
+                if "callback_query" in update:
+                    await self._on_callback(update["callback_query"])
+                else:
+                    self._on_update(update)
 
     async def _skip_backlog(self) -> None:
         """켜져 있지 않던 동안 쌓인 메시지는 버린다. 옛 명령이 뒤늦게 실행되면 곤란하다."""
@@ -1067,7 +1089,13 @@ class TelegramCommands:
     async def _fetch(self, timeout: int = POLL_TIMEOUT) -> list[dict]:
         response = await self._client.get(
             API.format(token=self._cfg.telegram_token, method="getUpdates"),
-            params={"offset": self._offset, "timeout": timeout},
+            params={
+                "offset": self._offset,
+                "timeout": timeout,
+                # 빠뜨리면 텔레그램이 예전에 설정된 값을 그대로 쓴다. 버튼 누름
+                # (callback_query)이 빠져 있으면 버튼이 영영 응답하지 않는다.
+                "allowed_updates": json.dumps(ALLOWED_UPDATES),
+            },
         )
         body = response.json()
         if not body.get("ok"):
@@ -1094,6 +1122,44 @@ class TelegramCommands:
         # 명령 응답은 물어본 곳에만 간다. 디스코드에 텔레그램 명령 결과가 뜨면
         # 왜 뜨는지 알 수 없다.
         self._queue.put(raw(self._core.dispatch(text), only="telegram"))
+
+    async def _on_callback(self, query: dict) -> None:
+        """알림 아래 버튼을 눌렀을 때.
+
+        답(answerCallbackQuery)을 **반드시** 보낸다. 안 보내면 버튼에 로딩 표시가
+        한참 돌다 사라져, 사용자는 눌렸는지 모른다. 답에 실패해도 처리는 이어간다.
+        """
+        query_id = query.get("id", "")
+        chat = str(((query.get("message") or {}).get("chat") or {}).get("id", ""))
+        token = query.get("data") or ""
+
+        if chat != str(self._cfg.telegram_chat_id):
+            log.warning("허용되지 않은 chat_id(%s)의 버튼을 무시했습니다: %s", chat, token[:40])
+            await self._answer(query_id, "이 봇은 주인만 조작할 수 있습니다.")
+            return
+
+        command = action_to_command(token)
+        if command is None:
+            # 지금은 없는 버튼이다. 옛 버전이 보낸 알림의 버튼일 수 있다.
+            log.warning("모르는 버튼을 무시했습니다: %s", token[:40])
+            await self._answer(query_id, "더 이상 쓰지 않는 버튼입니다.")
+            return
+
+        log.info("텔레그램 버튼: %s", command)
+        reply = self._core.dispatch(command)
+        # 토스트에는 첫 줄만. 태그를 걷어내야 글자 그대로 보이지 않는다.
+        toast = re.sub(r"<[^>]+>", "", reply.splitlines()[0] if reply else "")[:180]
+        await self._answer(query_id, toast)
+        self._queue.put(raw(reply, only="telegram", actions=undo_actions(token)))
+
+    async def _answer(self, query_id: str, text: str) -> None:
+        try:
+            await self._client.post(
+                API.format(token=self._cfg.telegram_token, method="answerCallbackQuery"),
+                data={"callback_query_id": query_id, "text": text},
+            )
+        except Exception as e:
+            log.warning("버튼 응답 실패: %s", e)
 
     async def close(self) -> None:
         await self._client.aclose()

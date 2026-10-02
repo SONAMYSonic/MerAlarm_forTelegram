@@ -22,6 +22,7 @@ from discord import app_commands
 from .. import alerts
 from ..alerts import Alert
 from ..commands import GLOBAL_SETTINGS, KEYWORD_SETTINGS, CommandCore
+from ..silence import action_to_command, undo_actions
 from . import discord_embed, markup
 
 # 봇이 아직 안 붙었을 때 알림 하나를 얼마나 기다려 줄지. 무한정 기다리면 디스코드가
@@ -66,6 +67,48 @@ def _set_choices() -> list[app_commands.Choice[str]]:
     ]
 
 
+# 우리 버튼의 custom_id 앞머리. 다른 것과 섞이지 않게 붙인다.
+ACTION_PREFIX = "ma:"
+
+
+def _action_button(bot: "DiscordBot"):
+    """알림 아래 버튼. 봇에 묶인 클래스를 만든다.
+
+    보통 버튼은 그 메시지를 보낸 프로세스가 살아 있는 동안만 받는다. 재시작하면
+    옛 알림의 버튼이 "상호작용 실패"로 끝난다. DynamicItem 은 custom_id 의 모양만
+    보고 다시 붙잡으므로, 서버를 업데이트한 뒤에도 어제 온 알림의 버튼이 된다.
+
+    클래스를 함수 안에서 만드는 이유는 누를 때 이 봇의 명령 코어로 넘겨야 하기
+    때문이다. 디스코드가 버튼을 되살릴 때는 우리 쪽 인스턴스를 모른다.
+    """
+
+    class ActionButton(
+        discord.ui.DynamicItem[discord.ui.Button],
+        template=ACTION_PREFIX + r"(?P<token>[a-z]+:[A-Za-z0-9:]{1,80})",
+    ):
+        def __init__(self, token: str, label: str = "") -> None:
+            style = (
+                discord.ButtonStyle.danger
+                if token.startswith("block:")
+                else discord.ButtonStyle.secondary
+            )
+            super().__init__(
+                discord.ui.Button(
+                    label=label or "…", style=style, custom_id=ACTION_PREFIX + token
+                )
+            )
+            self.token = token
+
+        @classmethod
+        async def from_custom_id(cls, interaction, item, match):
+            return cls(match["token"], getattr(item, "label", "") or "")
+
+        async def callback(self, interaction: discord.Interaction) -> None:
+            await bot._on_action(interaction, self.token)
+
+    return ActionButton
+
+
 class DiscordBot:
     """전송 채널이면서 명령 수신기다. `SendQueue` 에는 그냥 채널로 보인다."""
 
@@ -93,6 +136,8 @@ class DiscordBot:
         self._client = discord.Client(intents=intents)
         self._tree = app_commands.CommandTree(self._client)
         self._register()
+        self._Action = _action_button(self)
+        self._client.add_dynamic_items(self._Action)
 
     # ---- 접속 ----
 
@@ -163,14 +208,36 @@ class DiscordBot:
         try:
             if alert.kind == alerts.RAW:
                 # 이미 텔레그램 HTML 로 쓰인 글. 그대로 보내면 태그가 글자로 보인다.
-                for part in markup.chunks(markup.from_html(alert.body)):
-                    await channel.send(part)
+                await self._send_parts(channel.send, markup.from_html(alert.body), alert.actions)
             else:
-                await channel.send(embed=discord.Embed.from_dict(discord_embed.build(alert)))
+                embed = discord.Embed.from_dict(discord_embed.build(alert))
+                view = self._view(alert.actions)
+                if view is None:
+                    await channel.send(embed=embed)
+                else:
+                    await channel.send(embed=embed, view=view)
             return True
         except discord.HTTPException as e:
             log.error("디스코드 전송 실패: %s", e)
             return False
+
+    def _view(self, actions) -> discord.ui.View | None:
+        if not actions:
+            return None
+        view = discord.ui.View(timeout=None)
+        for label, token in actions:
+            view.add_item(self._Action(token, label))
+        return view
+
+    async def _send_parts(self, send, text: str, actions=()) -> None:
+        """길면 여러 통으로 나눠 보낸다. 버튼은 마지막 통에만 붙인다."""
+        parts = markup.chunks(text)
+        for n, part in enumerate(parts):
+            view = self._view(actions) if n == len(parts) - 1 else None
+            if view is None:
+                await send(part)
+            else:
+                await send(part, view=view)
 
     async def _channel(self):
         if self._failed:
@@ -187,7 +254,7 @@ class DiscordBot:
 
     # ---- 명령 받기 ----
 
-    async def _run(self, interaction: discord.Interaction, text: str) -> None:
+    async def _run(self, interaction: discord.Interaction, text: str, actions=()) -> None:
         if interaction.user.id != self._owner_id:
             log.warning(
                 "허용되지 않은 사용자(%s)의 명령을 무시했습니다: %s",
@@ -211,14 +278,22 @@ class DiscordBot:
 
         try:
             reply = self._core.dispatch(text)
-            for part in markup.chunks(markup.from_html(reply)):
-                await interaction.followup.send(part)
+            await self._send_parts(interaction.followup.send, markup.from_html(reply), actions)
         except Exception:
             log.exception("디스코드 명령 응답 중 오류")
             try:
                 await interaction.followup.send("⚠️ 처리 중 오류가 났습니다. 로그를 확인하세요.")
             except discord.HTTPException:
                 pass
+
+    async def _on_action(self, interaction: discord.Interaction, token: str) -> None:
+        """알림 아래 버튼을 눌렀을 때. 주인 확인과 답장은 슬래시 명령과 같은 길로 간다."""
+        command = action_to_command(token)
+        if command is None:
+            # 지금은 없는 버튼이다. 옛 버전이 보낸 알림의 버튼일 수 있다.
+            await interaction.response.send_message("더 이상 쓰지 않는 버튼입니다.", ephemeral=True)
+            return
+        await self._run(interaction, command, undo_actions(token))
 
     def _register(self) -> None:
         tree = self._tree
@@ -319,6 +394,48 @@ class DiscordBot:
             scope = f"{number} " if number is not None else ""
             tail = "" if verb == "list" else f"{verb} {words or ''}"
             await self._run(interaction, f"/require {scope}{tail}".rstrip())
+
+        @tree.command(name="mute", description="상품 무시 — 값을 내려도 안 알림")
+        @app_commands.describe(
+            action="무엇을 할지 (비우면 목록, 상품만 적으면 무시하기)",
+            item="상품 주소나 번호 (예: m12345678901)",
+        )
+        @app_commands.choices(
+            action=[
+                app_commands.Choice(name="목록 보기", value="list"),
+                app_commands.Choice(name="무시하기", value="add"),
+                app_commands.Choice(name="되돌리기", value="del"),
+            ]
+        )
+        async def mute(
+            interaction: discord.Interaction,
+            action: app_commands.Choice[str] | None = None,
+            item: str | None = None,
+        ):
+            verb = action.value if action else ("add" if item else "list")
+            text = "/mute" if verb == "list" else f"/mute {verb} {item or ''}".rstrip()
+            await self._run(interaction, text)
+
+        @tree.command(name="block", description="판매자 차단 — 이 판매자 상품은 안 알림")
+        @app_commands.describe(
+            action="무엇을 할지 (비우면 목록, 판매자만 적으면 차단하기)",
+            seller="판매자 프로필 주소나 번호 (숫자)",
+        )
+        @app_commands.choices(
+            action=[
+                app_commands.Choice(name="목록 보기", value="list"),
+                app_commands.Choice(name="차단하기", value="add"),
+                app_commands.Choice(name="되돌리기", value="del"),
+            ]
+        )
+        async def block(
+            interaction: discord.Interaction,
+            action: app_commands.Choice[str] | None = None,
+            seller: str | None = None,
+        ):
+            verb = action.value if action else ("add" if seller else "list")
+            text = "/block" if verb == "list" else f"/block {verb} {seller or ''}".rstrip()
+            await self._run(interaction, text)
 
         @tree.command(name="pause", description="잠시 멈추기")
         @app_commands.describe(duration="30m, 2h 처럼. 비우면 무기한")

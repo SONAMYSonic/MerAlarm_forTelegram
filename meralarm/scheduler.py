@@ -199,6 +199,42 @@ class Scheduler:
             log.info("[%s] 다른 키워드에서 이미 알린 %d건 건너뜀", kw.name, suppressed)
         return kept_new, kept_drops
 
+    def _drop_silenced(
+        self,
+        kw: KeywordConfig,
+        new: list[Item],
+        drops: list[tuple[Item, int]],
+    ) -> tuple[list[Item], list[tuple[Item, int]]]:
+        """무시한 상품과 차단한 판매자의 상품을 알림 후보에서 뺀다.
+
+        **알림만 빼고 기록은 남긴다.** 여기서 빠진 상품은 _poll 의 pending 에
+        들어가지 않으므로 그 아래에서 곧바로 가격이 기록된다. 기록까지 멈추면
+        그 상품이 검색에서 사라진 것처럼 낡아 지워지고, 무시를 풀었을 때 옛 매물이
+        "신규"로 쏟아진다.
+
+        중복 제거 뒤에 두는 이유는, 그쪽이 인하 기준가를 "마지막으로 알린 가격"으로
+        바꿔 주기 때문이다. 무시를 풀고 처음 오는 인하 알림도 사용자가 마지막으로 본
+        가격과 견준다.
+        """
+        if not new and not drops:
+            return new, drops
+        candidates = new + [i for i, _ in drops]
+        muted, blocked = self._store.silenced(
+            [i.id for i in candidates], [i.seller_id for i in candidates]
+        )
+        if not muted and not blocked:
+            return new, drops
+
+        def quiet(item: Item) -> bool:
+            return item.id in muted or item.seller_id in blocked
+
+        kept_new = [i for i in new if not quiet(i)]
+        kept_drops = [(i, p) for i, p in drops if not quiet(i)]
+        dropped = len(new) + len(drops) - len(kept_new) - len(kept_drops)
+        if dropped:
+            log.info("[%s] 무시·차단한 %d건 건너뜀", kw.name, dropped)
+        return kept_new, kept_drops
+
     def _enqueue_new(self, kw: KeywordConfig, new: list[Item]) -> None:
         # 오래된 것부터 보내야 알림 순서가 시간 흐름과 맞는다.
         new = sorted(new, key=lambda i: i.created)
@@ -371,6 +407,7 @@ class Scheduler:
             drops = []
         ledger = self._store.notified_prices([i.id for i in items])
         new, drops = self._drop_duplicates(kw, ledger, new, drops)
+        new, drops = self._drop_silenced(kw, new, drops)
 
         # 처음 본 상품 중 오래됐거나 끌어올린 것은 신규로 알리지 않는다. 갱신만으로
         # 상위에 떠오른 것을 새 물건이라고 알리면 거짓말이 되기 때문이다. 대신
@@ -483,15 +520,18 @@ class Scheduler:
         self._purge_date = today
         try:
             items, notified = self._store.purge(self._cfg.store.keep_days)
+            # items 를 먼저 정리해야 그 결과를 보고 무시 기록을 지울 수 있다
+            unmuted = self._store.purge_muted(self._cfg.store.keep_days)
         except Exception:
             log.exception("기록 정리 실패. 감시는 계속합니다")
             return
-        if items or notified:
+        if items or notified or unmuted:
             log.info(
-                "%d일 넘게 보이지 않은 기록 정리: 상품 %d건 · 알림 원장 %d건",
+                "%d일 넘게 보이지 않은 기록 정리: 상품 %d건 · 알림 원장 %d건 · 무시 %d건",
                 self._cfg.store.keep_days,
                 items,
                 notified,
+                unmuted,
             )
 
     def _maybe_heartbeat(self) -> None:

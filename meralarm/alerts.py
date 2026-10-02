@@ -9,6 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from .models import Item
+from .silence import item_actions
 
 NEW = "new"
 DROP = "drop"
@@ -32,12 +33,22 @@ class Alert:
     on_sent: Callable[[], None] | None = None
     # 특정 채널에만 보낼 때 그 이름. 명령 응답은 물어본 곳에만 가야 한다.
     only: str | None = None
+    # 알림 아래에 붙일 버튼. (보이는 글자, 표식). 표식의 뜻은 silence.py 에 있다.
+    # 버튼을 그릴 수 있는 채널만 그리고, 웹훅처럼 못 그리는 곳은 그냥 무시한다.
+    actions: tuple[tuple[str, str], ...] = ()
 
 
 def new_item(
     item: Item, keyword: str, krw_rate: float | None, on_sent: Callable[[], None] | None = None
 ) -> Alert:
-    return Alert(kind=NEW, keyword=keyword, item=item, krw_rate=krw_rate, on_sent=on_sent)
+    return Alert(
+        kind=NEW,
+        keyword=keyword,
+        item=item,
+        krw_rate=krw_rate,
+        on_sent=on_sent,
+        actions=item_actions(item),
+    )
 
 
 def price_drop(
@@ -54,6 +65,7 @@ def price_drop(
         old_price=old_price,
         krw_rate=krw_rate,
         on_sent=on_sent,
+        actions=item_actions(item),
     )
 
 
@@ -72,13 +84,15 @@ def notice(title: str, body: str, only: str | None = None) -> Alert:
     return Alert(kind=NOTICE, title=title, body=body, only=only)
 
 
-def raw(text: str, only: str) -> Alert:
+def raw(text: str, only: str, actions: tuple[tuple[str, str], ...] = ()) -> Alert:
     """이미 그 채널 문법으로 쓰인 글을 그대로 보낸다.
 
     `only` 를 반드시 지정한다. 한 채널의 문법으로 쓰인 글을 다른 채널로 보내면
     태그가 글자 그대로 보이거나 전송이 거절된다.
+
+    `actions` 는 버튼으로 무시·차단했을 때 그 답장에 붙일 되돌리기 버튼이다.
     """
-    return Alert(kind=RAW, body=text, only=only)
+    return Alert(kind=RAW, body=text, only=only, actions=actions)
 
 
 # ---- 채널 공통 계산 ----

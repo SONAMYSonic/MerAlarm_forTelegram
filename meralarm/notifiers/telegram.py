@@ -6,6 +6,7 @@
 """
 
 import asyncio
+import json
 import logging
 from html import escape
 
@@ -120,7 +121,7 @@ class TelegramNotifier:
         text = _clip(text, CAPTION_LIMIT if photo else TEXT_LIMIT)
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
-                response = await self._post(text, photo)
+                response = await self._post(text, photo, alert.actions)
             except httpx.HTTPError as e:
                 log.warning("텔레그램 전송 오류 (%d/%d): %s", attempt, MAX_ATTEMPTS, e)
                 await asyncio.sleep(2**attempt)
@@ -143,26 +144,33 @@ class TelegramNotifier:
         log.error("텔레그램 전송을 %d회 시도 후 포기했습니다", MAX_ATTEMPTS)
         return False
 
-    async def _post(self, text: str, photo: str | None) -> httpx.Response:
+    async def _post(
+        self, text: str, photo: str | None, actions: tuple[tuple[str, str], ...] = ()
+    ) -> httpx.Response:
         if photo:
-            return await self._client.post(
-                API.format(token=self._token, method="sendPhoto"),
-                data={
-                    "chat_id": self._chat_id,
-                    "photo": photo,
-                    "caption": text,
-                    "parse_mode": "HTML",
-                },
-            )
-        return await self._client.post(
-            API.format(token=self._token, method="sendMessage"),
-            data={
+            data = {
+                "chat_id": self._chat_id,
+                "photo": photo,
+                "caption": text,
+                "parse_mode": "HTML",
+            }
+            method = "sendPhoto"
+        else:
+            data = {
                 "chat_id": self._chat_id,
                 "text": text,
                 "parse_mode": "HTML",
                 "disable_web_page_preview": "true",
-            },
-        )
+            }
+            method = "sendMessage"
+        if actions:
+            # 버튼은 한 줄에 나란히. 누르면 표식(callback_data)이 그대로 돌아온다.
+            data["reply_markup"] = json.dumps(
+                {"inline_keyboard": [[{"text": label, "callback_data": token}
+                                       for label, token in actions]]},
+                ensure_ascii=False,
+            )
+        return await self._client.post(API.format(token=self._token, method=method), data=data)
 
     async def close(self) -> None:
         await self._client.aclose()
