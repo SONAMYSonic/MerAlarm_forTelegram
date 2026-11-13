@@ -48,6 +48,11 @@ DURATION = re.compile(r"^(\d+)\s*([smh]?)$", re.IGNORECASE)
 # 뒤늦게 확정되면 무엇을 승인했는지 모르게 된다.
 PENDING_TTL_SEC = 300
 
+# `/exclude del all` 처럼 이 말 하나만 적으면 목록을 통째로 비운다.
+ALL_WORDS = {"all", "전부", "모두"}
+# 한 번에 넣을 수 있는 말의 수. 되돌리는 명령도 이만큼씩 끊어 만든다.
+MAX_WORDS = 20
+
 
 @dataclass(frozen=True, slots=True)
 class Pending:
@@ -110,10 +115,12 @@ HELP = """<b>MerAlarm 명령어</b>
 <code>/exclude</code> — 모든 키워드에 적용되는 목록
 <code>/exclude add まとめ</code> — 모든 키워드에 넣기
 <code>/exclude del まとめ</code> — 빼기
+<code>/exclude del all</code> — 전부 빼기
 
 <code>/exclude 2</code> — 2번 키워드의 제외어 보기
 <code>/exclude 2 add セット</code> — 2번 키워드에만 넣기
 <code>/exclude 2 del セット</code> — 2번에서 빼기
+<code>/exclude 2 del all</code> — 2번 것 전부 빼기
 
 <b>엉뚱한 상품이 잔뜩 걸릴 때</b>
 검색어가 짧으면 그 말이 다른 낱말 속에 박혀서도 걸립니다.
@@ -124,6 +131,7 @@ HELP = """<b>MerAlarm 명령어</b>
 <code>/require 2 add シャニマス アイドルマスター</code>
 
 이 중 하나라도 제목에 있어야 알립니다. 없으면 안 알립니다.
+전부 빼려면 <code>/require 2 del all</code>
 
 넣기 전에 지금 추적 중인 상품 몇 건이 걸리는지 먼저 보여드립니다.
 제외어는 대소문자도 전각/반각도 가리지 않습니다.
@@ -468,11 +476,13 @@ class CommandCore:
             "<b>모든 키워드에</b>\n"
             "<code>/exclude</code> — 지금 목록\n"
             "<code>/exclude add まとめ ジャンク</code> — 넣기\n"
-            "<code>/exclude del まとめ</code> — 빼기\n\n"
+            "<code>/exclude del まとめ</code> — 빼기\n"
+            "<code>/exclude del all</code> — 전부 빼기\n\n"
             "<b>한 키워드에만</b> (번호는 /list 기준)\n"
             "<code>/exclude 2</code> — 2번 키워드의 제외어\n"
             "<code>/exclude 2 add セット</code> — 2번에만 넣기\n"
-            "<code>/exclude 2 del セット</code> — 2번에서 빼기"
+            "<code>/exclude 2 del セット</code> — 2번에서 빼기\n"
+            "<code>/exclude 2 del all</code> — 2번 것 전부 빼기"
         )
 
     def _exclude_show(self, index: int | None = None) -> str:
@@ -531,8 +541,8 @@ class CommandCore:
                 raise ParseError("제외어가 너무 깁니다. 50자 이내로 써주세요.")
             if word not in cleaned:
                 cleaned.append(word)
-        if len(cleaned) > 20:
-            raise ParseError("한 번에 20개까지만 넣을 수 있습니다.")
+        if len(cleaned) > MAX_WORDS:
+            raise ParseError(f"한 번에 {MAX_WORDS}개까지만 넣을 수 있습니다.")
         return cleaned
 
     def _exclude_add(self, words: list[str], index: int | None = None) -> str:
@@ -643,9 +653,15 @@ class CommandCore:
         )
 
     def _exclude_remove(self, words: list[str], index: int | None = None) -> str:
+        scope = "" if index is None else f"{index} "
         if not words:
             sample = "/exclude del まとめ" if index is None else f"/exclude {index} del セット"
-            return f"뺄 말을 적어주세요. 예: <code>{escape(sample)}</code>"
+            return (
+                f"뺄 말을 적어주세요. 예: <code>{escape(sample)}</code>\n"
+                f"전부 빼려면 <code>/exclude {scope}del all</code>"
+            )
+        if len(words) == 1 and words[0].lower() in ALL_WORDS:
+            return self._exclude_clear(index)
 
         removed: list[str] = []
         missing: list[str] = []
@@ -679,6 +695,65 @@ class CommandCore:
                 "원래 없던 말: " + " ".join(f"<code>{escape(w)}</code>" for w in missing)
             )
         return "\n".join(lines)
+
+    def _exclude_clear(self, index: int | None = None) -> str:
+        """`/exclude del all`. 콜라보가 끝났을 때처럼 한 무더기를 한 번에 뺀다.
+
+        확인을 묻지 않는다. 빼는 쪽은 알림이 조용히 죽지 않고 늘어날 뿐이고, 답장에
+        되돌리는 명령을 그대로 붙여 준다.
+        """
+        try:
+            if index is None:
+                name, removed = "", self._store.clear_global_excludes(validate=self._validator())
+                # 전역만 비운다. 키워드마다 넣은 것까지 지우면 범위가 명령과 어긋난다.
+                others = any(excludes for _, excludes in self._store.entries())
+            else:
+                name, removed = self._store.clear_keyword_words(
+                    index, "exclude", validate=self._validator()
+                )
+                others = False
+        except KeywordStoreError as e:
+            return f"⚠️ {escape(str(e))}"
+
+        where = "전역 제외어" if index is None else f"<b>{escape(name)}</b> 의 제외어"
+        if not removed:
+            return f"{where}가 없습니다."
+        self._reload()
+
+        lines = [
+            f"🗑 {where} {len(removed)}개를 전부 뺐습니다: "
+            + " ".join(f"<code>{escape(w)}</code>" for w in removed),
+            "이 말들이 든 상품도 다시 알림 대상이 됩니다.",
+        ]
+        if others:
+            lines.append(
+                "키워드마다 따로 넣은 제외어는 그대로입니다. "
+                "빼려면 <code>/exclude 번호 del all</code>"
+            )
+        scope = "" if index is None else f"{index} "
+        return "\n".join(lines + self._restore_lines(f"/exclude {scope}add", removed))
+
+    @staticmethod
+    def _restore_lines(command: str, words: list[str]) -> list[str]:
+        """잘못 뺐을 때 그대로 붙여넣을 명령. 한 번에 넣을 수 있는 수만큼 끊는다.
+
+        띄어쓰기가 든 말(손으로 적은 설정에만 있다)은 명령에 섞으면 두 낱말로 쪼개져
+        조용히 다른 조건이 된다. 그런 말은 명령에서 빼고 따로 알린다.
+        """
+        whole = [w for w in words if len(w.split()) == 1]
+        spaced = [w for w in words if len(w.split()) != 1]
+        lines = []
+        if whole:
+            lines += ["", "되돌리려면"]
+            for start in range(0, len(whole), MAX_WORDS):
+                chunk = " ".join(whole[start : start + MAX_WORDS])
+                lines.append(f"<code>{escape(command)} {escape(chunk)}</code>")
+        if spaced:
+            lines.append(
+                "띄어쓰기가 든 말은 명령으로 못 넣어 config.yaml 에 직접 적어야 합니다: "
+                + " ".join(f"<code>{escape(w)}</code>" for w in spaced)
+            )
+        return lines
 
     # ---- 필수 포함어 ----
     #
@@ -725,7 +800,8 @@ class CommandCore:
             "<code>/require</code> — 전체 목록\n"
             "<code>/require 2</code> — 2번 키워드의 필수 포함어\n"
             "<code>/require 2 add シャニマス アイドルマスター</code> — 넣기\n"
-            "<code>/require 2 del シャニマス</code> — 빼기\n\n"
+            "<code>/require 2 del シャニマス</code> — 빼기\n"
+            "<code>/require 2 del all</code> — 전부 빼기\n\n"
             "검색어가 짧아 엉뚱한 상품이 잔뜩 걸릴 때 씁니다. "
             "제외어로 하나씩 막는 것보다 확실합니다."
         )
@@ -844,7 +920,12 @@ class CommandCore:
 
     def _require_remove(self, words: list[str], index: int) -> str:
         if not words:
-            return f"뺄 말을 적어주세요. 예: <code>/require {index} del シャニマス</code>"
+            return (
+                f"뺄 말을 적어주세요. 예: <code>/require {index} del シャニマス</code>\n"
+                f"전부 빼려면 <code>/require {index} del all</code>"
+            )
+        if len(words) == 1 and words[0].lower() in ALL_WORDS:
+            return self._require_clear(index)
 
         removed: list[str] = []
         missing: list[str] = []
@@ -877,6 +958,25 @@ class CommandCore:
                 "원래 없던 말: " + " ".join(f"<code>{escape(w)}</code>" for w in missing)
             )
         return "\n".join(lines)
+
+    def _require_clear(self, index: int) -> str:
+        """`/require 2 del all`. 제외어 쪽과 같은 까닭으로 확인을 묻지 않는다."""
+        try:
+            name, removed = self._store.clear_keyword_words(
+                index, "require", validate=self._validator()
+            )
+        except KeywordStoreError as e:
+            return f"⚠️ {escape(str(e))}"
+        if not removed:
+            return f"<b>{escape(name)}</b> 에는 필수 포함어가 없습니다."
+        self._reload()
+
+        lines = [
+            f"🗑 <b>{escape(name)}</b> 의 필수 포함어 {len(removed)}개를 전부 뺐습니다: "
+            + " ".join(f"<code>{escape(w)}</code>" for w in removed),
+            "이제 제목을 따지지 않고 검색에 걸린 것을 모두 봅니다.",
+        ]
+        return "\n".join(lines + self._restore_lines(f"/require {index} add", removed))
 
     def _set(self, argument: str) -> str:
         tokens = argument.split()

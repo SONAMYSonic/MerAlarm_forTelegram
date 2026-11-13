@@ -12,7 +12,9 @@ from pathlib import Path
 from typing import Any
 
 from ruamel.yaml import YAML
-from ruamel.yaml.comments import CommentedSeq
+from ruamel.yaml.comments import CommentedMap, CommentedSeq
+from ruamel.yaml.error import CommentMark
+from ruamel.yaml.tokens import CommentToken
 
 from .text import fold
 
@@ -40,13 +42,92 @@ def _name_of(entry) -> str:
     return str(entry.get("name") or entry.get("query") or "").strip()
 
 
+# ---- 목록에서 말을 뺄 때 남의 주석 지키기 ----
+#
+# ruamel 은 블록 목록 바로 뒤에 오는 빈 줄과 주석 — 실은 **다음 항목**을 설명하는
+# 것 — 을 그 목록의 마지막 항목에 매단다. 그래서 마지막 말을 빼거나 목록을 비우면
+# 다음 항목의 주석까지 함께 사라진다. 빼기 전에 떼어 두었다가 남는 자리에 다시 잇는다.
+
+
+def _take_tail(seq) -> str | None:
+    """마지막 항목에 매달린 '그 뒤 줄들'을 떼어 낸다. 옮길 것이 없으면 None.
+
+    돌려주는 글은 줄바꿈(빠지는 항목 줄의 끝)으로 시작한다. 그 항목 자신의 줄끝
+    주석은 항목과 함께 버린다.
+    """
+    if not isinstance(seq, CommentedSeq) or not len(seq):
+        return None
+    slot = seq.ca.items.get(len(seq) - 1)
+    token = slot[0] if slot else None
+    if token is None:
+        return None
+    slot[0] = None
+    text = token.value
+    if text.startswith("#"):
+        text = text[text.index("\n"):] if "\n" in text else "\n"
+    return text if text.strip() or text.count("\n") > 1 else None
+
+
+def _put_after(node, key, text: str) -> None:
+    """node[key] 의 마지막 줄 뒤에 잇는다. 값이 블록 목록·매핑이면 그 끝으로 들어간다."""
+    value = node[key]
+    if isinstance(value, (CommentedSeq, CommentedMap)):
+        if not len(value):
+            # `[]` 뒤에는 매달 자리가 없다. 억지로 달면 파일이 깨진다. 드문 모양이라 버린다.
+            return
+        if not value.fa.flow_style():
+            last = len(value) - 1 if isinstance(value, CommentedSeq) else list(value)[-1]
+            _put_after(value, last, text)
+            return
+    # 목록 항목은 0번 자리, 매핑 값은 2번 자리가 "이 줄 뒤" 주석이다.
+    index = 0 if isinstance(node, CommentedSeq) else 2
+    slot = node.ca.items.setdefault(key, [None, None, None, None])
+    if slot[index] is None:
+        slot[index] = CommentToken(text, CommentMark(0), None)
+    else:
+        # 이미 줄끝 주석이 있으면 그것이 줄을 끝낸다. 우리 글의 첫 줄바꿈은 뺀다.
+        slot[index].value += text[1:]
+
+
+def _put_before(mapping, key, text: str) -> None:
+    """mapping 의 key 바로 앞에 줄마다 넣는다. 글에 든 들여쓰기를 그대로 쓴다.
+
+    비운 목록은 `[]` 한 줄이 되거나 아예 지워져 뒤에 주석을 매달 항목이 없다. ruamel 도
+    `[]` 뒤의 주석은 다음 키 앞에 둔다(배포판 config.example.yaml 의 전역 exclude 가
+    그 모양이다).
+    """
+    slot = mapping.ca.items.setdefault(key, [None, [], None, None])
+    if slot[1] is None:
+        slot[1] = []
+    slot[1][:0] = [CommentToken(line + "\n", CommentMark(0), None) for line in text[1:].splitlines()]
+
+
+def _delete_items(seq, positions) -> str | None:
+    """seq 에서 positions 번째 항목들을 뺀다.
+
+    마지막 항목이 빠지면 거기 매달린 뒤 주석을 새 마지막 항목으로 옮긴다. 목록이 통째로
+    비면 옮길 곳이 없으니 그 글을 돌려준다 — 놓을 자리는 부르는 쪽이 안다.
+    """
+    tail = _take_tail(seq) if len(seq) - 1 in positions else None
+    # 앞에서부터 지우면 뒤 번호가 당겨진다. 음수 번호는 ruamel 이 주석 자리를 잘못 옮긴다.
+    for position in sorted(positions, reverse=True):
+        del seq[position]
+    if tail and len(seq):
+        _put_after(seq, len(seq) - 1, tail)
+        return None
+    return tail
+
+
 class KeywordStore:
     def __init__(self, path: Path) -> None:
         self._path = path
 
     def _load(self):
         yaml = _yaml()
-        data = yaml.load(self._path)
+        # 줄바꿈을 \n 으로 맞춰 읽는다. CRLF 파일을 그대로 주면 ruamel 이 주석을 \r\n 째
+        # 들고 있다가, 쓸 때 주석마다 빈 줄을 만들거나(윈도우) 목록 뒤 빈 줄을 먹는다.
+        # 원래 줄바꿈으로 되돌려 쓰는 것은 _save 가 한다.
+        data = yaml.load(self._path.read_text(encoding="utf-8-sig"))
         if data is None or "keywords" not in data:
             raise KeywordStoreError("config.yaml 에서 keywords 를 찾지 못했습니다.")
         return yaml, data
@@ -58,13 +139,20 @@ class KeywordStore:
         되돌린다. 이게 없으면 봇 명령 한 번으로 파일이 깨져 **다음 재시작 때 아예
         켜지지 않는** 상태가 될 수 있다. 무인 운영에서는 치명적이다.
         """
-        original = self._path.read_text(encoding="utf-8")
+        original = self._path.read_bytes()
 
-        # 임시 파일에 쓰고 바꿔치기한다. 쓰는 도중에 죽어도 원본이 남는다.
         buf = io.StringIO()
         yaml.dump(data, buf)
+        # 읽을 때 \n 으로 맞췄으니(_load) 원래 파일이 주로 쓰던 줄바꿈으로 되돌린다.
+        # 바이트째 쓴다. 텍스트 모드로 쓰면 윈도우가 \n 을 \r\n 으로 바꾸는데, 예전엔
+        # 주석만 \r\n 째 들고 있어서 주석마다 \r\r\n — 메모장에서 빈 줄 — 이 생겼다.
+        text = buf.getvalue()
+        if original.count(b"\r\n") * 2 > original.count(b"\n"):
+            text = text.replace("\n", "\r\n")
+
+        # 임시 파일에 쓰고 바꿔치기한다. 쓰는 도중에 죽어도 원본이 남는다.
         tmp = self._path.with_suffix(".yaml.tmp")
-        tmp.write_text(buf.getvalue(), encoding="utf-8")
+        tmp.write_bytes(text.encode("utf-8"))
         os.replace(tmp, self._path)
 
         if validate is None:
@@ -72,7 +160,7 @@ class KeywordStore:
         try:
             validate()
         except Exception as e:
-            self._path.write_text(original, encoding="utf-8")
+            self._path.write_bytes(original)
             raise KeywordStoreError(f"설정이 올바르지 않아 되돌렸습니다.\n{e}") from None
 
     def names(self) -> list[str]:
@@ -222,9 +310,31 @@ class KeywordStore:
         if index is None:
             raise KeywordStoreError(f"'{word}' 는 전역 제외어에 없습니다.")
         removed = str(seq[index]).strip()
-        del seq[index]
+        self._drop_global(data, [index])
         self._save(yaml, data, validate)
         return removed
+
+    def clear_global_excludes(self, validate: Callable[[], object] | None = None) -> list[str]:
+        """전역 제외어를 전부 뺀다. 뺀 말을 돌려준다 — 되돌리는 명령을 만들 때 쓴다.
+
+        목록은 `[]` 로 남긴다. 키까지 지우면 그 위에 붙은 설명 주석이 함께 사라진다.
+        """
+        yaml, data = self._load()
+        seq = data.get("exclude")
+        words = [str(w).strip() for w in (seq or []) if w is not None and str(w).strip()]
+        if not words:
+            return []
+        self._drop_global(data, range(len(seq)))
+        self._save(yaml, data, validate)
+        return words
+
+    @staticmethod
+    def _drop_global(data, positions) -> None:
+        tail = _delete_items(data["exclude"], positions)
+        keys = list(data)
+        after = keys.index("exclude") + 1
+        if tail and after < len(keys):
+            _put_before(data, keys[after], tail)
 
     # ---- 키워드별 낱말 목록 (exclude / require) ----
     #
@@ -305,13 +415,42 @@ class KeywordStore:
                 f"{self.LABELS.get(field, field)}에 없습니다."
             )
         removed = str(seq[position]).strip()
-        del seq[position]
-        # 다 빼면 항목 자체를 지운다. 빈 목록을 남기면 "- " 만 있는 줄이 되어
-        # 예전에 상품을 삼켰던 그 모양으로 이어질 수 있다.
-        if not len(seq):
-            entry.pop(field, None)
+        self._drop_words(entry, field, [position])
         self._save(yaml, data, validate)
         return _name_of(entry), removed
+
+    def clear_keyword_words(
+        self, index: int, field: str, validate: Callable[[], object] | None = None
+    ) -> tuple[str, list[str]]:
+        """(키워드 이름, 뺀 말). 그 키워드의 낱말 목록을 전부 뺀다."""
+        yaml, data = self._load()
+        entry = self._entry(data, index)
+        seq = entry.get(field)
+        words = [str(w).strip() for w in (seq or []) if w is not None and str(w).strip()]
+        if not words:
+            return _name_of(entry), []
+        self._drop_words(entry, field, range(len(seq)))
+        self._save(yaml, data, validate)
+        return _name_of(entry), words
+
+    @staticmethod
+    def _drop_words(entry, field: str, positions) -> None:
+        seq = entry[field]
+        tail = _delete_items(seq, positions)
+        if len(seq):
+            return
+        # 다 빼면 항목 자체를 지운다. 빈 목록을 남기면 "- " 만 있는 줄이 되어
+        # 예전에 상품을 삼켰던 그 모양으로 이어질 수 있다.
+        keys = list(entry)
+        at = keys.index(field)
+        entry.pop(field, None)
+        if not tail:
+            return
+        # 뒤따르던 주석은 다음 키 앞에 둔다. 이 목록이 맨 끝이었으면 앞 키 뒤에 잇는다.
+        if at + 1 < len(keys):
+            _put_before(entry, keys[at + 1], tail)
+        elif at > 0:
+            _put_after(entry, keys[at - 1], tail)
 
     # 예전 이름. 부르는 곳이 읽기 쉬우라고 남겨둔다.
 

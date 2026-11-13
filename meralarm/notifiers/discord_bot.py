@@ -67,6 +67,19 @@ def _set_choices() -> list[app_commands.Choice[str]]:
     ]
 
 
+def _word_action(verb: str, words: str | None) -> str:
+    """/exclude · /require 선택지를 명령 뒷부분으로 바꾼다.
+
+    목록 보기에는 동작 이름을 붙이지 않는다. "list" 를 그대로 넘기면 모르는 사용법이
+    된다. 전부 빼기는 낱말 칸을 보지 않는다 — 비워 둔 채 고르는 것이라서.
+    """
+    if verb == "list":
+        return ""
+    if verb == "clear":
+        return "del all"
+    return f"{verb} {words or ''}"
+
+
 # 우리 버튼의 custom_id 앞머리. 다른 것과 섞이지 않게 붙인다.
 ACTION_PREFIX = "ma:"
 
@@ -351,6 +364,7 @@ class DiscordBot:
                 app_commands.Choice(name="목록 보기", value="list"),
                 app_commands.Choice(name="넣기", value="add"),
                 app_commands.Choice(name="빼기", value="del"),
+                app_commands.Choice(name="전부 빼기", value="clear"),
                 app_commands.Choice(name="넣기 확인", value="yes"),
             ]
         )
@@ -360,12 +374,9 @@ class DiscordBot:
             words: str | None = None,
             number: int | None = None,
         ):
-            # 목록 보기에는 동작 이름을 붙이지 않는다. "list" 를 그대로 넘기면
-            # 모르는 사용법이 된다.
             verb = action.value if action else "list"
             scope = f"{number} " if number is not None else ""
-            tail = "" if verb == "list" else f"{verb} {words or ''}"
-            await self._run(interaction, f"/exclude {scope}{tail}".rstrip())
+            await self._run(interaction, f"/exclude {scope}{_word_action(verb, words)}".rstrip())
 
         @tree.command(name="require", description="필수 포함어 — 이 말이 없으면 안 알림")
         @app_commands.describe(
@@ -378,6 +389,7 @@ class DiscordBot:
                 app_commands.Choice(name="목록 보기", value="list"),
                 app_commands.Choice(name="넣기", value="add"),
                 app_commands.Choice(name="빼기", value="del"),
+                app_commands.Choice(name="전부 빼기", value="clear"),
                 app_commands.Choice(name="넣기 확인", value="yes"),
             ]
         )
@@ -392,8 +404,7 @@ class DiscordBot:
                 await self._run(interaction, "/require yes")
                 return
             scope = f"{number} " if number is not None else ""
-            tail = "" if verb == "list" else f"{verb} {words or ''}"
-            await self._run(interaction, f"/require {scope}{tail}".rstrip())
+            await self._run(interaction, f"/require {scope}{_word_action(verb, words)}".rstrip())
 
         @tree.command(name="mute", description="상품 무시 — 값을 내려도 안 알림")
         @app_commands.describe(
