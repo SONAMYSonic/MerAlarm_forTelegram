@@ -31,6 +31,8 @@ class Alert:
     krw_rate: float | None = None
     # 전송에 성공한 뒤에만 불린다. 채널이 여럿이면 하나라도 성공하면 실행한다.
     on_sent: Callable[[], None] | None = None
+    # 끝내 못 보냈을 때 불린다(모든 채널 실패, 대기열이 넘쳐 버림). 둘 중 하나만 불린다.
+    on_failed: Callable[[], None] | None = None
     # 특정 채널에만 보낼 때 그 이름. 명령 응답은 물어본 곳에만 가야 한다.
     only: str | None = None
     # 알림 아래에 붙일 버튼. (보이는 글자, 표식). 표식의 뜻은 silence.py 에 있다.
@@ -39,7 +41,11 @@ class Alert:
 
 
 def new_item(
-    item: Item, keyword: str, krw_rate: float | None, on_sent: Callable[[], None] | None = None
+    item: Item,
+    keyword: str,
+    krw_rate: float | None,
+    on_sent: Callable[[], None] | None = None,
+    on_failed: Callable[[], None] | None = None,
 ) -> Alert:
     return Alert(
         kind=NEW,
@@ -47,6 +53,7 @@ def new_item(
         item=item,
         krw_rate=krw_rate,
         on_sent=on_sent,
+        on_failed=on_failed,
         actions=item_actions(item),
     )
 
@@ -57,6 +64,7 @@ def price_drop(
     old_price: int,
     krw_rate: float | None,
     on_sent: Callable[[], None] | None = None,
+    on_failed: Callable[[], None] | None = None,
 ) -> Alert:
     return Alert(
         kind=DROP,
@@ -65,6 +73,7 @@ def price_drop(
         old_price=old_price,
         krw_rate=krw_rate,
         on_sent=on_sent,
+        on_failed=on_failed,
         actions=item_actions(item),
     )
 
@@ -74,9 +83,15 @@ def batch(
     keyword: str,
     krw_rate: float | None,
     on_sent: Callable[[], None] | None = None,
+    on_failed: Callable[[], None] | None = None,
 ) -> Alert:
     return Alert(
-        kind=BATCH, keyword=keyword, items=tuple(items), krw_rate=krw_rate, on_sent=on_sent
+        kind=BATCH,
+        keyword=keyword,
+        items=tuple(items),
+        krw_rate=krw_rate,
+        on_sent=on_sent,
+        on_failed=on_failed,
     )
 
 

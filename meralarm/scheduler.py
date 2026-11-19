@@ -77,6 +77,9 @@ class Scheduler:
         self._rate_date: date | None = None
         self._heartbeat_date: date | None = None
         self._purge_date: date | None = None
+        # 대기열에 넣었지만 아직 결과를 모르는 상품 번호. 알림은 보낸 **뒤에** 기록하므로,
+        # 이것 없이는 기다리는 동안 다음 회차가 같은 상품을 또 넣는다(_drop_sending).
+        self._sending: set[str] = set()
         self.stats = Stats()
 
     # ---- 바깥에서 조작하는 부분 ----
@@ -156,9 +159,25 @@ class Scheduler:
 
     def _on_notified(self, keyword: str, items: list[Item]) -> None:
         """전송에 성공한 뒤에만 불린다."""
-        self._store.record(keyword, items)
-        for item in items:
-            self._store.mark_notified(keyword, item)
+        try:
+            self._store.record(keyword, items)
+            for item in items:
+                self._store.mark_notified(keyword, item)
+        finally:
+            self._sending.difference_update(i.id for i in items)
+
+    def _on_failed(self, items: list[Item]) -> None:
+        """끝내 못 보냈다. 기록하지 않고 표시만 푼다 — 다음 회차가 다시 잡는다."""
+        self._sending.difference_update(i.id for i in items)
+
+    def _put(self, alert: alerts.Alert, items: list[Item]) -> None:
+        """대기열에 넣는다. 결과가 나올 때까지 이 상품들은 보내는 중이다.
+
+        넣기 **전에** 표시한다. 대기열이 꽉 차 있으면 put 안에서 곧바로 on_failed 가
+        불려 표시가 풀린다.
+        """
+        self._sending.update(i.id for i in items)
+        self._queue.put(alert)
 
     def _drop_duplicates(
         self,
@@ -235,24 +254,51 @@ class Scheduler:
             log.info("[%s] 무시·차단한 %d건 건너뜀", kw.name, dropped)
         return kept_new, kept_drops
 
+    def _drop_sending(
+        self,
+        kw: KeywordConfig,
+        new: list[Item],
+        drops: list[tuple[Item, int]],
+    ) -> tuple[list[Item], list[tuple[Item, int]]]:
+        """아직 보내는 중인 상품을 알림 후보에서 뺀다.
+
+        알림은 보낸 뒤에 기록하므로, 대기열에서 기다리는 동안 다음 회차가 같은 상품을
+        또 신규·인하로 잡는다. 평소엔 몇 초면 보내져서 드러나지 않다가, 텔레그램이
+        Bad Gateway 를 내며 전송이 밀린 날(2026-11-19) 같은 인하 36건이 3시간 동안
+        740번 나갔고 대기열 500칸이 같은 알림으로 찼다.
+
+        보내고 나면 기록이 남아 다음 회차부터 평소대로 판정된다. 끝내 못 보내면 표시가
+        풀려 다시 잡힌다. 그사이 값이 더 내려도 보낸 뒤 다음 회차에 그 차이로 알린다.
+        """
+        if not self._sending:
+            return new, drops
+        kept_new = [i for i in new if i.id not in self._sending]
+        kept_drops = [(i, p) for i, p in drops if i.id not in self._sending]
+        waiting = len(new) + len(drops) - len(kept_new) - len(kept_drops)
+        if waiting:
+            log.info("[%s] 아직 보내는 중인 %d건 건너뜀", kw.name, waiting)
+        return kept_new, kept_drops
+
     def _enqueue_new(self, kw: KeywordConfig, new: list[Item]) -> None:
         # 오래된 것부터 보내야 알림 순서가 시간 흐름과 맞는다.
         new = sorted(new, key=lambda i: i.created)
 
         if len(new) >= self._cfg.notify.batch_threshold:
-            self._queue.put(
+            self._put(
                 alerts.batch(
                     new,
                     kw.name,
                     self._krw_rate,
                     on_sent=lambda items=tuple(new): self._on_notified(kw.name, list(items)),
-                )
+                    on_failed=lambda items=tuple(new): self._on_failed(list(items)),
+                ),
+                new,
             )
             log.info("[%s] 신규 %d건 → 묶음 요약 1건", kw.name, len(new))
             return
 
         for item in new:
-            self._queue.put(
+            self._put(
                 alerts.new_item(
                     item,
                     kw.name,
@@ -260,19 +306,23 @@ class Scheduler:
                     # 전송에 성공한 뒤에 기록한다. 먼저 기록하면 전송 전에 죽었을 때
                     # 본 것으로 남아 그 상품은 영영 알림이 오지 않는다.
                     on_sent=lambda i=item: self._on_notified(kw.name, [i]),
-                )
+                    on_failed=lambda i=item: self._on_failed([i]),
+                ),
+                [item],
             )
 
     def _enqueue_drops(self, kw: KeywordConfig, drops: list[tuple[Item, int]]) -> None:
         for item, old_price in drops:
-            self._queue.put(
+            self._put(
                 alerts.price_drop(
                     item,
                     kw.name,
                     old_price,
                     self._krw_rate,
                     on_sent=lambda i=item: self._on_notified(kw.name, [i]),
-                )
+                    on_failed=lambda i=item: self._on_failed([i]),
+                ),
+                [item],
             )
             log.info(
                 "[%s] 가격 인하: ¥%s → ¥%s %s",
@@ -408,6 +458,7 @@ class Scheduler:
         ledger = self._store.notified_prices([i.id for i in items])
         new, drops = self._drop_duplicates(kw, ledger, new, drops)
         new, drops = self._drop_silenced(kw, new, drops)
+        new, drops = self._drop_sending(kw, new, drops)
 
         # 처음 본 상품 중 오래됐거나 끌어올린 것은 신규로 알리지 않는다. 갱신만으로
         # 상위에 떠오른 것을 새 물건이라고 알리면 거짓말이 되기 때문이다. 대신
@@ -418,7 +469,9 @@ class Scheduler:
 
         # 알림 대상이 아닌 상품은 곧바로 기록을 갱신한다. 가격이 오른 경우도 여기
         # 포함되며, 그래야 다음 인하를 오른 가격 기준으로 계산한다.
-        pending = {i.id for i in new} | {i.id for i, _ in drops}
+        # 보내는 중인 상품은 빼고 기록한다. 지금 값을 적어 두면 끝내 못 보냈을 때
+        # 그 신규·인하가 다시 잡히지 않는다. 보내고 나면 on_sent 가 기록한다.
+        pending = {i.id for i in new} | {i.id for i, _ in drops} | self._sending
         self._store.record(kw.name, [i for i in items if i.id not in pending])
 
         if not new and not drops:

@@ -6,6 +6,10 @@
 채널이 여럿이면 같은 알림을 모두에게 보낸다. **하나라도 성공하면 본 것으로
 기록한다** — 전부 성공해야 기록하게 하면 디스코드가 잠깐 죽었을 때 텔레그램으로
 같은 알림이 계속 다시 간다.
+
+알림마다 결과를 꼭 하나 돌려준다. 보냈으면 `on_sent`, 전부 실패했거나 대기열이
+넘쳐 버렸으면 `on_failed`. 스케줄러는 그 사이 그 상품을 "보내는 중"으로 두고 다시
+넣지 않는다. 결과를 안 알려주면 그 상품은 영영 보내는 중으로 남는다.
 """
 
 import asyncio
@@ -17,6 +21,16 @@ from .base import Notifier
 SEND_GAP_SEC = 1.1
 
 log = logging.getLogger(__name__)
+
+
+def _settle(callback) -> None:
+    """결과 콜백을 부른다. 콜백이 터져도 전송 작업은 이어간다."""
+    if callback is None:
+        return
+    try:
+        callback()
+    except Exception:
+        log.exception("전송 결과를 처리하다 예외가 발생했습니다")
 
 
 class SendQueue:
@@ -50,6 +64,7 @@ class SendQueue:
             # 큐가 넘칠 정도면 이미 뭔가 잘못된 상태다. 메모리를 지키는 쪽을 택한다.
             self.dropped += 1
             log.error("전송 큐가 가득 차 메시지를 버렸습니다 (누적 %d건)", self.dropped)
+            _settle(alert.on_failed)
 
     @property
     def pending(self) -> int:
@@ -64,6 +79,7 @@ class SendQueue:
                 ]
                 if not targets:
                     log.warning("보낼 채널이 없습니다: only=%s", alert.only)
+                    _settle(alert.on_failed)
                     continue
 
                 results = []
@@ -76,8 +92,9 @@ class SendQueue:
 
                 if any(results):
                     self.sent += 1
-                    if alert.on_sent is not None:
-                        alert.on_sent()
+                    _settle(alert.on_sent)
+                else:
+                    _settle(alert.on_failed)
             except Exception:
                 log.exception("전송 작업에서 예외가 발생했습니다")
             finally:
